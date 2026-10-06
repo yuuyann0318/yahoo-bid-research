@@ -97,6 +97,21 @@ class TestDailyBudget(unittest.TestCase):
             finally:
                 os.chmod(d, 0o700)
 
+    def test_unsaved_is_scoped_to_jst_date(self):
+        """Codex r3#7: 未保存の消費を翌日に繰り越さない。"""
+        with tempfile.TemporaryDirectory() as d:
+            b = self._budget(d, {"yahoo": 1})
+            os.chmod(d, 0o500)
+            try:
+                self.assertTrue(b.spend("yahoo", 1))
+                self.assertFalse(b.spend("yahoo", 1))
+                # 日付が変わった状況を再現
+                b._unsaved_date = "2000-01-01"
+                self.assertEqual(b.used("yahoo"), 0, "前日の未保存分が残っている")
+                self.assertTrue(b.spend("yahoo", 1), "翌日なのに消費できない")
+            finally:
+                os.chmod(d, 0o700)
+
     def test_unsaved_is_cleared_once_save_succeeds(self):
         with tempfile.TemporaryDirectory() as d:
             b = self._budget(d, {"yahoo": 5})

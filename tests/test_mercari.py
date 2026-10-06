@@ -576,6 +576,66 @@ class TestBlockHookInstall(unittest.TestCase):
         self.assertIsNone(mercari.MercapiAdapter().hook_installed)
 
 
+class TestFailClosedWithoutHook(unittest.TestCase):
+    """Codex r3#1: フックを張れない環境では**1回も照会しない**（fail-closed）。"""
+
+    def test_adapter_raises_before_sending_request(self):
+        """install_block_hook が False を返したら mc.search を呼ばずに例外にする。"""
+        import ybr.mercari as m
+        original = m.install_block_hook
+        searched = []
+
+        class FakeMercapi:
+            async def search(self, *_a, **_kw):  # pragma: no cover - 呼ばれないのが正解
+                searched.append(1)
+                raise AssertionError("フック未登録なのに検索を実行した")
+
+        m.install_block_hook = lambda _inst: False
+        try:
+            adapter = m.MercapiAdapter()
+            # Mercapi と SearchRequestData の import は実物を使う（存在確認も兼ねる）
+            with self.assertRaises(m.MercariHookUnavailableError):
+                adapter.search("テスト")
+        finally:
+            m.install_block_hook = original
+        self.assertEqual(searched, [])
+        self.assertFalse(adapter.hook_installed)
+
+    def test_comps_marks_blocked_with_hook_unavailable(self):
+        class AD:
+            calls = 0
+
+            def search(self, _q):
+                AD.calls += 1
+                raise mercari.MercariHookUnavailableError("テスト用")
+
+        p = build_profile("accessory", {})
+        state = mercari.MercariState()
+        mc = mercari.MercariComps(p, NullCompsCache(), adapter=AD(),
+                                  throttle_fn=lambda _s: None, state=state)
+        cand = {"title": "テスト 商品", "keyword": "テスト"}
+        mc.fetch(cand)
+        self.assertEqual(cand["comps_status"], "blocked")
+        self.assertEqual(state.blocked_status, mercari.HOOK_UNAVAILABLE_STATUS)
+        self.assertTrue(state.aborted)
+        # 2件目は照会しない
+        mc.fetch({"title": "別の 商品", "keyword": "別"})
+        self.assertEqual(AD.calls, 1)
+
+    def test_error_message_mentions_detection_failure(self):
+        e = mercari.MercariHookUnavailableError("detail")
+        self.assertIn("403/429 を検知できない", str(e))
+        self.assertIn("相場照会を中止", str(e))
+
+    def test_blocked_status_accepts_non_int(self):
+        state = mercari.MercariState()
+        state.record_blocked(mercari.HOOK_UNAVAILABLE_STATUS)
+        self.assertEqual(state.blocked_status, "hook_unavailable")
+        state2 = mercari.MercariState()
+        state2.record_blocked("403")
+        self.assertEqual(state2.blocked_status, 403)
+
+
 class TestSharedState(unittest.TestCase):
     """H2: 中断状態と連続失敗数を実行全体で共有する（カテゴリをまたいで効く）。"""
 

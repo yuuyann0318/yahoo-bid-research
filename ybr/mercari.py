@@ -253,6 +253,23 @@ class MercariBlockedError(RuntimeError):
         super().__init__("メルカリ側にブロックされました(HTTP {})".format(self.status))
 
 
+class MercariHookUnavailableError(RuntimeError):
+    """403/429 検出フックを張れなかった（照会を一切しないで止めるためのシグナル）。
+
+    フックが無いと mercapi はブロックを「解析エラー」として返してしまい、
+    ブロックされたまま照会を続けることになる。検知できない環境では
+    **fail-closed**（照会しない）にする（Codex r3#1）。
+    """
+
+    def __init__(self, detail=None):
+        self.detail = detail or "mercapi 内部クライアントにフックを登録できない"
+        super().__init__(
+            "403/429 を検知できない環境のため相場照会を中止しました（{}）".format(self.detail))
+
+
+# blocked_status に入れる「HTTPステータスではない中断理由」
+HOOK_UNAVAILABLE_STATUS = "hook_unavailable"
+
 MERCAPI_CLIENT_ATTR = "_client"
 
 
@@ -323,7 +340,12 @@ class MercapiAdapter:
 
         async def _run():
             mc = Mercapi()
-            adapter.hook_installed = install_block_hook(mc)
+            installed = install_block_hook(mc)
+            adapter.hook_installed = installed
+            if not installed:
+                # fail-closed: 検知できないなら**リクエストを送らない**（Codex r3#1）
+                raise MercariHookUnavailableError(
+                    "{}.event_hooks['response'] に登録できない".format(MERCAPI_CLIENT_ATTR))
             res = await mc.search(query, status=[SearchRequestData.Status.STATUS_SOLD_OUT])
             return list(res.items)
 
@@ -357,8 +379,12 @@ class MercariState:
         return self.consecutive_failures
 
     def record_blocked(self, status):
+        """status は HTTP ステータス(int) か HOOK_UNAVAILABLE_STATUS 等の文字列。"""
         self.blocked = True
-        self.blocked_status = int(status)
+        try:
+            self.blocked_status = int(status)
+        except (TypeError, ValueError):
+            self.blocked_status = status
         self.aborted = True
 
     def stopped(self):
@@ -508,6 +534,12 @@ class MercariComps:
             self.requests_made += 1
             try:
                 raw_items = self.adapter.search(query)
+            except MercariHookUnavailableError as e:
+                # fail-closed: 以降の候補も照会しない（Codex r3#1）
+                self.state.fetch_failures += 1
+                self.state.last_error = str(e)
+                self.state.record_blocked(HOOK_UNAVAILABLE_STATUS)
+                return self._fail(candidate, "blocked", str(e), first_query)
             except Exception as e:  # noqa: BLE001 - mercapi不在/通信障害=相場取得不能
                 error_text = "{}: {}".format(e.__class__.__name__, str(e)[:120])
                 status = e.status if isinstance(e, MercariBlockedError) else _http_status_of(e)

@@ -195,6 +195,8 @@ class DailyBudget:
         self.save_failed = False
         # H3: 保存に失敗した消費はディスクに残らない。同一実行内で消えないよう
         # メモリに保持し、used()/spend() で必ず合算する（上限1なら1回しか通らない）。
+        # Codex r3#7: JST 日付ごとに持つ（日付が変われば前日の未保存分は繰り越さない）。
+        self._unsaved_date = today_str()
         self._unsaved = {}
         parent = os.path.dirname(path)
         if parent:
@@ -245,11 +247,20 @@ class DailyBudget:
                     except OSError:
                         pass
 
+    def _unsaved_for(self, kind):
+        """未保存の消費（JST 日付が変わったら破棄する・Codex r3#7）。"""
+        today = today_str()
+        if self._unsaved_date != today:
+            self._unsaved_date = today
+            self._unsaved = {}
+        return int(self._unsaved.get(kind, 0))
+
     def used(self, kind):
         """ディスク上の消費 + **保存できなかった消費**（H3）。"""
+        unsaved = self._unsaved_for(kind)
         with self._locked():
             on_disk = int((self._read_state().get("counts") or {}).get(kind, 0))
-        return on_disk + int(self._unsaved.get(kind, 0))
+        return on_disk + unsaved
 
     def remaining(self, kind):
         return max(0, int(self.limits.get(kind, 0)) - self.used(kind))
@@ -263,7 +274,7 @@ class DailyBudget:
         n = int(n)
         if n <= 0:
             return True
-        unsaved = int(self._unsaved.get(kind, 0))
+        unsaved = self._unsaved_for(kind)
         with self._locked():
             state = self._read_state()
             counts = state.setdefault("counts", {})

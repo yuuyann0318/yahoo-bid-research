@@ -413,6 +413,13 @@ def run(argv=None, deps=None, base_dir=None):
     mercari_adapter = deps.get("mercari_adapter")
     if mercari_adapter is None:
         mercari_adapter = ybr_mercari.MercapiAdapter()
+        # fail-closed の前倒し: 403/429 を検知できない環境なら1回も照会しない（Codex r3#1）。
+        hook_ok, hook_detail = ybr_mercari.hook_support_status()
+        if not hook_ok:
+            mercari_state.last_error = str(
+                ybr_mercari.MercariHookUnavailableError(hook_detail))
+            mercari_state.record_blocked(ybr_mercari.HOOK_UNAVAILABLE_STATUS)
+            logger.log("mercari_hook_unavailable", detail=hook_detail)
     for cand in kept:
         cat = cand.get("category")
         profile = profiles_by_cat.get(cat) or ybr_profiles.load_union_profile(base_dir)
@@ -464,7 +471,11 @@ def run(argv=None, deps=None, base_dir=None):
 
     # C4: ブロック・連続失敗の中断は「成功件数に関係なく」exit3 + ⚠️バナー
     mercari_degraded = None
-    if mercari_blocked is not None:
+    if mercari_blocked == ybr_mercari.HOOK_UNAVAILABLE_STATUS:
+        mercari_degraded = (
+            "403/429 を検知できない環境のため相場照会を中止しました"
+            "（mercapi/httpx の仕様変更の可能性。bin/ybr selftest を確認）")
+    elif mercari_blocked is not None:
         mercari_degraded = "メルカリ相場の取得がブロックされ中断しました(HTTP {})".format(
             mercari_blocked)
     elif mercari_aborted:
@@ -603,9 +614,11 @@ def selftest(argv=None, base_dir=None):
     lines.append("mercapi ブロック検出フック: {} ({})".format(
         "OK" if hook_ok else "NG", hook_detail))
     if not hook_ok:
+        # Codex r3#2: 検知できない環境は selftest を失敗にする（終了コード非0）。
+        ok = False
         lines.append(
             "  ⚠️ 403/429 を検知できません（mercapi/httpx の仕様変更の可能性）。"
-            "相場の結果を信用しないこと。")
+            "この状態では run は相場照会をせず終了コード3で止まります（fail-closed）。")
 
     state_dir = args.state_dir or os.path.join(base_dir, "state")
     try:

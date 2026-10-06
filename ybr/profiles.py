@@ -95,49 +95,66 @@ _BRAND_ALIASES = {
     "カーハート": ["carhartt"],
 }
 
-# 品位+めっき表記（K18GP / 18KGP / SV925GP / 925GF ...）。照合側は NFKC+小文字化済み。
-# 末尾の (?![0-9a-z]) で "k18gps" のような誤爆を防ぐ（M5）。
 # 金属の品位表記（この後ろに GP/GF が来たら「めっき」と判断する）
-_KARAT = r"(?:k\s*\d{1,2}|\d{1,2}\s*k|sv\s*\d{3}|925|750|585|417|18k|14k|10k)"
-# GP / GF に区切り（空白・ハイフン・中黒）を挿し込んだ迂回表記（G-P / G F）。
-# 末尾の (?![0-9a-z]) で GPS / GFx を誤爆させない。
-_GP_SEP = r"g[\s\-・･]?p(?![0-9a-z])"
-_GF_SEP = r"g[\s\-・･]?f(?![0-9a-z])"
+_KARAT = r"(?:k\s*\d{1,2}|\d{1,2}\s*k|sv\s*\d{3}|925|750|585|417)"
+# GP / GF の区切り挿入（「K18 G - P」「K18 G.P」「K18 G  F」まで拾う・Codex r3#5）。
+_GSEP = r"[\s　\-・･.．]"
+# 型番（GF-01 / GP-02）は めっき表記ではないので除外する（監査 A3）。
+_NOT_MODEL = r"(?![0-9a-z])(?!{}*\d)".format(_GSEP)
+_GP_SEP = r"g{}{{0,3}}p{}".format(_GSEP, _NOT_MODEL)
+_GF_SEP = r"g{}{{0,3}}f{}".format(_GSEP, _NOT_MODEL)
 
 _PLATING_PATTERNS = [
-    # 品位表記の直後の GP/GF（区切り挿入も許す）
-    r"{}\s*-?\s*(?:{}|{})".format(_KARAT, _GP_SEP, _GF_SEP),
-    r"\d{{1,2}}\s*金\s*(?:{}|{})".format(_GP_SEP, _GF_SEP),
-    r"gold\s*-?\s*(plated|filled)",
-    r"(?<![0-9a-z])(gp|gf)\s*-?\s*(刻印|加工|仕上げ)",
-    # 単独語としての G-P / G・F（区切り必須。素の "gp" は ngWords 側で拾う）
-    r"(?<![0-9a-z])g[\s\-・･]p(?![0-9a-z])",
-    r"(?<![0-9a-z])g[\s\-・･]f(?![0-9a-z])",
+    # 品位表記の直後の GP/GF（区切り挿入も許す）: K18GP / 18K GP / K18 G - P / SV925G.F
+    r"{}{}{{0,3}}(?:{}|{})".format(_KARAT, _GSEP, _GP_SEP, _GF_SEP),
+    r"\d{{1,2}}{}*金{}*(?:{}|{})".format(_GSEP, _GSEP, _GP_SEP, _GF_SEP),
+    r"gold{}*(plated|filled)".format(_GSEP),
+    # 単独語としての GP / GF（素の "gp" もここで拾う。GPS・G-SHOCK・GF-01 は拾わない）
+    r"(?<![0-9a-z])(?:{}|{})".format(_GP_SEP, _GF_SEP),
 ]
 
 # --- 否定表現の救済（M13 の完全包含判定を前提にした正規表現） ---
 # 否定語そのもの
 _NEG = (r"(?:ありません|ございません|なし|無し|ない|無い|なく|無く|"
         r"見当たりません|見られません)")
-# 二重否定・断定できない続き方は救済しない（Codex r2 Medium / 統括決定）。
-#   NG: 「GFじゃないわけではない」「虫食いはなくはない」
-_NO_DOUBLE = (r"(?!\s*(?:わけ|訳|こと|とも|とは|が|はない|は無い|はありません|"
-              r"はなく|は無く|もない|も無い))")
-_NEG_TAIL = _NEG + _NO_DOUBLE
-# 「〜ではありません」「〜じゃない」の前置き（品/商品 を許す・監査#2）
-_NEG_JOIN = r"\s*(?:品|商品)?\s*(?:では|じゃ|で は)\s*"
+# 否定語の前後をつなぐ区切り（中黒も許す: 「ダメージ・ありません」・監査 A2）
+_NSEP = r"[\s　・･]*"
+# **否定を打ち消す後続**だけを拒否する（Codex r3#3/#4・監査#1）。
+#   拒否: 「〜ないというわけではありません」「〜なくはない」「〜なしではありません」
+#         「〜とは限らない／とは言えない」
+#   許可: 「〜ありませんが、使用感はあります」「〜ないことを確認済み」
+#        （`が` `こと` は否定を反転させないので拒否しない）
+_NEG_REVERSAL = (
+    r"(?!"
+    r"{sep}(?:という|と言う)?{sep}(?:わけ|訳){sep}(?:では|じゃ)?{sep}"
+    r"(?:ない|ありません|ございません|無い)"
+    r"|{sep}とは{sep}(?:限らない|限りません|言えない|いえない|言えません)"
+    r"|{sep}は{sep}(?:ない|無い|ありません|ございません)"
+    r"|{sep}も{sep}(?:ない|無い|ありません|ございません)"
+    r"|{sep}くはない"
+    r"|{sep}(?:では|じゃ){sep}(?:ない|無い|ありません|ございません)"
+    r")".format(sep=_NSEP)
+)
+_NEG_TAIL = _NEG + _NEG_REVERSAL
+# 「〜ではありません」「〜じゃない」の前置き（品/商品/加工 を許す・監査#2 / Codex r3#6）
+_NEG_JOIN = (r"{sep}(?:品|商品|加工|仕上げ|刻印|処理)?{sep}"
+             r"(?:では|じゃ|で は){sep}").format(sep=_NSEP)
 
 # くっついた表記（K18GPではありません）は語リストでは救えないのでパターンで救う。
 _PLATING_NEGATION_PATTERNS = [
-    r"(?:{})?\s*-?\s*(?:gp|gf|{}|{})\s*(?:品|商品|刻印)?\s*(?:では|じゃ)\s*{}".format(
-        _KARAT, _GP_SEP, _GF_SEP, _NEG_TAIL),
-    r"(?:金|銀)?\s*(?:メッキ|めっき)" + _NEG_JOIN + _NEG_TAIL,
+    r"(?:{}{}{{0,3}})?(?:gp|gf|{}|{}){}{}".format(
+        _KARAT, _GSEP, _GP_SEP, _GF_SEP, _NEG_JOIN, _NEG_TAIL),
+    # 「メッキ加工ではありません」も救済する（Codex r3#6）。
+    # 「メッキ加工済み」は否定が続かないので引き続きNG。
+    r"(?:金|銀)?{}*(?:メッキ|めっき)".format(_GSEP) + _NEG_JOIN + _NEG_TAIL,
 ]
 # 模倣表現の否定。長いNG語（スーパーコピー）ごと覆えるよう接頭辞も含める（監査#2）。
 _FAKE_NEGATION_PATTERNS = [
     r"(?:スーパー|ハイ|精巧な|精巧)?(?:コピー|レプリカ|偽物|模造|イミテーション)"
     + _NEG_JOIN + _NEG_TAIL,
 ]
+# 「申し訳ありません」が「訳あり」に誤爆するのを防ぐ（監査#1）
+_APOLOGY_PATTERNS = [r"申[しス]?訳(?:あり|ござい)"]
 
 ACCESSORY_DEFAULTS = {
     "label": "アクセサリー",
@@ -149,7 +166,8 @@ ACCESSORY_DEFAULTS = {
         "コピー", "スーパーコピー", "ノーブランド", "ジャンク",
         "まとめ売り", "まとめて", "セット売り", "部品取り", "偽物", "レプリカ",
         "模造", "イミテーション", "非正規", "自作", "ハンドメイド",
-        "めっき", "メッキ", "ノベルティ", "GP", "GF", "破損", "石取れ",
+        "めっき", "メッキ", "ノベルティ", "破損", "石取れ",
+        # GP / GF は ngPatterns 側で扱う（GF-01 のような型番を除外するため・監査A3）
     ],
     # 除外はしないが result.md の「注意」に出す語（accessory-profit-scout の DANGER_WORDS）
     "cautionWords": [
@@ -161,7 +179,8 @@ ACCESSORY_DEFAULTS = {
     # 正規表現での除外（GP/GF の刻印表記ゆれ）
     "ngPatterns": list(_PLATING_PATTERNS),
     # 正規表現での救済（否定表現。完全包含判定のため語リストでは救えない）
-    "allowPatterns": list(_PLATING_NEGATION_PATTERNS) + list(_FAKE_NEGATION_PATTERNS),
+    "allowPatterns": (list(_PLATING_NEGATION_PATTERNS) + list(_FAKE_NEGATION_PATTERNS)
+                      + list(_APOLOGY_PATTERNS)),
     # NG語を打ち消す否定・正規表現（これに重なる出現は除外扱いにしない）
     # 否定表現（「GPではありません」等）は **allowPatterns 側だけ** で扱う。
     # ここに平文で置くと二重否定（「GPではないわけではない」）まで救済してしまう。
@@ -195,10 +214,10 @@ APPAREL_DEFAULTS = {
     "brandSuffixNgWords": list(_BRAND_SUFFIX_NG),
     "brandAliases": dict(_BRAND_ALIASES),
     "ngPatterns": [],
-    "allowPatterns": list(_FAKE_NEGATION_PATTERNS) + [
-        r"(?:ダメージ|汚れ|破れ|穴|シミ|染み|虫食い|虫喰い|難|訳)"
-        r"\s*(?:は|も)?\s*" + _NEG_TAIL,
-    ],
+    "allowPatterns": (list(_FAKE_NEGATION_PATTERNS) + list(_APOLOGY_PATTERNS) + [
+        r"(?:ダメージ|汚れ|破れ|穴|シミ|染み|虫食い|虫喰い|難|訳|使用感|キズ|傷)"
+        + _NSEP + r"(?:は|も)?" + _NSEP + _NEG_TAIL,
+    ]),
     # 否定表現（「ダメージなし」「汚れありません」等）は allowPatterns 側だけで扱う。
     "allowPhrases": [
         "ダメージ加工", "ヴィンテージ加工", "ビンテージ加工", "加工ダメージ",

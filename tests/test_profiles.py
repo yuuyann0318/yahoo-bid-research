@@ -157,10 +157,26 @@ class TestUnionProfile(unittest.TestCase):
         self.assertEqual(self.union["category"], "unknown")
 
     def test_ng_words_include_both_categories(self):
-        for word in ("めっき", "GP", "石取れ"):          # accessory 側
+        for word in ("めっき", "メッキ", "石取れ"):        # accessory 側
             self.assertIn(word, self.union["ngWords"], word)
         for word in ("リメイク", "虫食い", "破れ"):        # apparel 側
             self.assertIn(word, self.union["ngWords"], word)
+
+    def test_plating_is_detected_by_patterns_not_words(self):
+        """GP/GF は ngWords ではなく ngPatterns 側（型番 GF-01 を除外するため・監査A3）。"""
+        from ybr import filter as ybr_filter
+        self.assertNotIn("GP", self.union["ngWords"])
+        self.assertTrue(self.union["ngPatterns"])
+
+        def hit(title):
+            return ybr_filter.ng_hit(
+                title, self.union["ngWords"], self.union["allowPhrases"],
+                self.union["ngPatterns"], allow_patterns=self.union["allowPatterns"])
+
+        self.assertIsNotNone(hit("ネックレス K18GP"))
+        self.assertIsNotNone(hit("ネックレス GP 刻印"))
+        self.assertIsNone(hit("ペンダント GF-01 型番"))
+        self.assertIsNone(hit("ガーミン GPS ウォッチ"))
 
     def test_jewelry_ng_applies_to_unknown_keyword(self):
         from ybr import filter as ybr_filter

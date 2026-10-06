@@ -207,6 +207,79 @@ class TestNgHit(unittest.TestCase):
         self.assertIsNone(self._app("BURBERRY LONDON トレンチコート 英国製"))
         self.assertIsNone(self._acc("TIFFANY&Co. オープンハート 正規"))
 
+    # --- Codex r3#3: 二重否定の網羅（否定を打ち消す後続は救済しない） ---
+    def test_double_negation_variants_are_not_rescued(self):
+        for title in ("GFではないというわけではありません",
+                      "GPではないわけではありません",
+                      "GFじゃないわけではない",
+                      "GPとは限らない",
+                      "メッキではないと言うわけではない"):
+            self.assertIsNotNone(self._acc(title), title)
+
+    def test_apparel_double_negation_variants_are_not_rescued(self):
+        for title in ("ダメージなしではありません",
+                      "ダメージなしではない",
+                      "ニット 虫食いはなくはない",
+                      "ニット 虫食いはないとは言えない"):
+            self.assertIsNotNone(self._app(title), title)
+
+    # --- Codex r3#4 / 監査#1: 否定を反転させない後続は救済する（誤除外の回帰） ---
+    def test_ga_continuation_is_still_rescued(self):
+        self.assertIsNone(self._app("ダメージはありませんが、使用感はあります"))
+        self.assertIsNone(self._acc("GPではありませんが保証書なし"))
+
+    def test_koto_continuation_is_still_rescued(self):
+        self.assertIsNone(self._app("ダメージはないことを確認済み"))
+        self.assertIsNone(self._acc("メッキではないことを確認しました"))
+
+    def test_apology_does_not_trigger_wakeari(self):
+        """監査#1: 「申し訳ありません」が『訳あり』に誤爆しない。"""
+        for title in ("申し訳ありませんが返品不可 デニム",
+                      "大変申し訳ございませんが同梱不可 コート"):
+            self.assertIsNone(self._app(title), title)
+
+    def test_apology_does_not_trigger_caution_either(self):
+        hits = ybr_filter.caution_hits(
+            "申し訳ありませんが返品不可", self.acc["cautionWords"],
+            self.acc["allowPhrases"], self.acc["allowPatterns"])
+        self.assertEqual(hits, [])
+
+    def test_real_wakeari_is_still_ng(self):
+        self.assertIsNotNone(self._app("訳あり品 デニム"))
+        self.assertIsNotNone(self._app("難あり ジャケット"))
+
+    # --- Codex r3#5 / 監査A3: GP/GF の区切りと型番の切り分け ---
+    def test_wide_separator_gp_gf_detected(self):
+        for title in ("K18 G - P ネックレス", "K18 G.P リング", "K18 G  F チェーン",
+                      "SV925 G・P ペンダント", "18金 G-F ブレス"):
+            self.assertIsNotNone(self._acc(title), title)
+
+    def test_gps_gshock_g1_not_detected(self):
+        for title in ("ガーミン GPS ウォッチ", "G-SHOCK 腕時計 美品",
+                      "G1 グランプリ 記念 コイン", "GPSロガー 付属"):
+            self.assertIsNone(self._acc(title), title)
+
+    def test_model_numbers_with_hyphen_digits_not_detected(self):
+        for title in ("ペンダント GF-01 型番", "リング GP-02 シリーズ",
+                      "ネックレス GP 12 ではなく GF-1234"):
+            result = self._acc(title)
+            if "ではなく" not in title:
+                self.assertIsNone(result, title)
+
+    # --- Codex r3#6: 「メッキ加工ではありません」の回帰 ---
+    def test_mekki_kakou_negation_is_rescued(self):
+        self.assertIsNone(self._acc("メッキ加工ではありません シルバー925"))
+        self.assertIsNone(self._acc("メッキ処理ではありません"))
+
+    def test_mekki_kakou_without_negation_is_ng(self):
+        self.assertIsNotNone(self._acc("メッキ加工済み ネックレス"))
+        self.assertIsNotNone(self._acc("金メッキ加工 リング"))
+
+    # --- 監査A2: 中黒区切りの否定 ---
+    def test_nakaguro_separated_negation_is_rescued(self):
+        self.assertIsNone(self._app("ダメージ・ありません"))
+        self.assertIsNone(self._app("汚れ・破れ ありません"))
+
     # --- M10/M12/M23: アパレル語彙の修正 ---
     def test_remake_is_ng(self):
         self.assertIsNotNone(self._app("リーバイス リメイク デニムスカート"))

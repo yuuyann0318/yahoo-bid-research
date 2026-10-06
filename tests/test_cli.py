@@ -410,6 +410,73 @@ class TestRealMercariBlockPath(unittest.TestCase):
             self.assertIn("連続", res["payload"]["meta"]["degraded"])
 
 
+class TestFailClosedHook(unittest.TestCase):
+    """Codex r3#1/#2: フックNGなら照会せず exit3＋バナー／selftest も非0。"""
+
+    def test_run_stops_with_exit3_and_banner(self):
+        from ybr import mercari as ybr_mercari
+        original = ybr_mercari.hook_support_status
+        ybr_mercari.hook_support_status = lambda: (False, "テスト: 内部属性が無い")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                argv = ["--category", "accessory", "--keywords", "ティファニー オープンハート",
+                        "--out", os.path.join(tmp, "o"),
+                        "--state-dir", os.path.join(tmp, "s"),
+                        "--no-cache", "--no-history"]
+                # mercari_adapter を注入しない＝本番経路（事前チェックが効く）
+                res = cli.run(argv, deps={"fetcher": lambda _u: _fixture_html(),
+                                          "throttle_fn": lambda _s: None})
+                self.assertEqual(res["exit_code"], 3)
+                meta = res["payload"]["meta"]
+                self.assertEqual(meta["mercari_blocked_status"], "hook_unavailable")
+                self.assertIn("403/429 を検知できない環境のため相場照会を中止",
+                              meta["degraded"])
+                self.assertEqual(meta["mercari_requests"], 0, "照会を1回も行わないこと")
+                self.assertEqual(res["payload"]["adopted"], [])
+                md = _md(res)
+                self.assertIn("⚠️", md)
+                self.assertIn("403/429 を検知できない環境のため相場照会を中止", md)
+                kinds = meta["excluded_reasons"]
+                self.assertTrue([k for k in kinds if "未照会" in k], kinds)
+        finally:
+            ybr_mercari.hook_support_status = original
+
+    def test_history_not_marked_when_hook_unavailable(self):
+        from ybr import mercari as ybr_mercari
+        original = ybr_mercari.hook_support_status
+        ybr_mercari.hook_support_status = lambda: (False, "テスト")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                state = os.path.join(tmp, "s")
+                argv = ["--category", "accessory", "--keywords", "ティファニー オープンハート",
+                        "--out", os.path.join(tmp, "o"), "--state-dir", state, "--no-cache"]
+                cli.run(argv, deps={"fetcher": lambda _u: _fixture_html(),
+                                    "throttle_fn": lambda _s: None})
+                self.assertFalse(os.path.exists(os.path.join(state, "history.json")))
+        finally:
+            ybr_mercari.hook_support_status = original
+
+    def test_selftest_fails_when_hook_unavailable(self):
+        from ybr import mercari as ybr_mercari
+        original = ybr_mercari.hook_support_status
+        ybr_mercari.hook_support_status = lambda: (False, "テスト: 登録不可")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                code = cli.selftest(["--state-dir", os.path.join(tmp, "s")])
+        finally:
+            ybr_mercari.hook_support_status = original
+        self.assertNotEqual(code, 0)
+        self.assertEqual(code, cli.EXIT_USAGE)
+
+    def test_selftest_ok_in_real_environment(self):
+        try:
+            import mercapi  # noqa: F401
+        except Exception:  # pragma: no cover
+            self.skipTest("mercapi 未インストール")
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(cli.selftest(["--state-dir", os.path.join(tmp, "s")]), 0)
+
+
 class TestBothLimitsAtOnce(unittest.TestCase):
     """H4: 実行上限と日次上限が同時に尽きても日次到達を記録し exit3・履歴なし。"""
 

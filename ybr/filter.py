@@ -170,15 +170,21 @@ def ng_hit(title, ng_words, allow_phrases=(), ng_patterns=(),
                             allow_phrases, allow_patterns)
 
 
-def caution_hits(title, caution_words):
-    """注意語（除外しない）のうち該当したものを列挙する。"""
+def caution_hits(title, caution_words, allow_phrases=(), allow_patterns=()):
+    """注意語（除外しない）のうち該当したものを列挙する。
+
+    NG語と同じ救済を適用する（「申し訳ありませんが」で『訳あり』を注意に出さない・監査#1）。
+    """
     hay = normalize_for_match(title)
     if not hay:
         return []
+    allowed = _allow_spans(hay, allow_phrases, allow_patterns)
     out = []
     for word in caution_words or ():
-        if _spans_of_word(hay, word):
-            out.append(word)
+        for span in _spans_of_word(hay, word):
+            if not _covered(span, allowed):
+                out.append(word)
+                break
     return out
 
 
@@ -272,7 +278,8 @@ def prefilter(items, profile, history=None, now=None):
             excluded.append(c)
             continue
 
-        c["cautions"] = caution_hits(c.get("title"), caution_words)
+        c["cautions"] = caution_hits(c.get("title"), caution_words,
+                                     allow_phrases, allow_patterns)
         if aid:
             seen_ids.add(aid)
         kept.append(c)
