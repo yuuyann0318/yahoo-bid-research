@@ -259,6 +259,24 @@ class TestNgHit(unittest.TestCase):
                       "G1 グランプリ 記念 コイン", "GPSロガー 付属"):
             self.assertIsNone(self._acc(title), title)
 
+    def test_plating_with_separated_numbers_is_detected(self):
+        """退行修正: 区切りを挟んだ数字（重さ・長さ・本数）まで型番扱いしない。
+
+        型番除外はハイフン直結＋数字だけ。これを広く取ると c5d3263 で検出できていた
+        「K18GP 2.5g」等を取り落とす。
+        """
+        for title in ("K18GP 2.5g", "18KGP 10.2g ネックレス", "K18GP 50cm チェーン",
+                      "GP 2本セット", "GP 3点 まとめ", "K18GP 5.5g リング",
+                      "SV925GF 3.2g", "18金GP 2本"):
+            self.assertIsNotNone(self._acc(title), title)
+
+    def test_model_number_exclusion_is_hyphen_only(self):
+        """ハイフン直結＋数字だけを型番として外す（両側を固定）。"""
+        for title in ("ペンダント GF-01 型番", "リング GP-02 シリーズ",
+                      "ガーミン GPS ウォッチ", "G-SHOCK 腕時計 美品",
+                      "K18GPS ケース", "G1 グランプリ 記念"):
+            self.assertIsNone(self._acc(title), title)
+
     def test_model_numbers_with_hyphen_digits_not_detected(self):
         for title in ("ペンダント GF-01 型番", "リング GP-02 シリーズ",
                       "ネックレス GP 12 ではなく GF-1234"):
@@ -279,6 +297,25 @@ class TestNgHit(unittest.TestCase):
     def test_nakaguro_separated_negation_is_rescued(self):
         self.assertIsNone(self._app("ダメージ・ありません"))
         self.assertIsNone(self._app("汚れ・破れ ありません"))
+
+    # --- 監査Minor: apparel でも金具のめっき表記を検出する ---
+    def test_apparel_detects_plating_patterns(self):
+        self.assertTrue(self.app["ngPatterns"], "apparel の ngPatterns が空")
+        for title in ("バッグ 金具 K18GP", "ベルト GP 金具", "コート gold plated ボタン",
+                      "ジャケット 18KGF ボタン"):
+            self.assertIsNotNone(self._app(title), title)
+
+    def test_apparel_plating_negation_is_rescued(self):
+        self.assertIsNone(self._app("メッキ加工ではありません 金具"))
+        self.assertIsNone(self._app("金具 GPではありません"))
+
+    def test_apparel_plating_does_not_false_positive(self):
+        """実データ610件で誤爆0件だったパターン群の代表例を固定する。"""
+        for title in ("パタゴニア フリース レトロX", "カシミヤ 100% コート",
+                      "BURBERRY LONDON トレンチ 英国製", "ステューシー 90s パーカー",
+                      "ノースフェイス ヌプシ 700フィルパワー", "Gジャン リーバイス 501",
+                      "big foot プリント Tシャツ", "バッグ 金具 GF-01"):
+            self.assertIsNone(self._app(title), title)
 
     # --- M10/M12/M23: アパレル語彙の修正 ---
     def test_remake_is_ng(self):

@@ -100,7 +100,9 @@ _KARAT = r"(?:k\s*\d{1,2}|\d{1,2}\s*k|sv\s*\d{3}|925|750|585|417)"
 # GP / GF の区切り挿入（「K18 G - P」「K18 G.P」「K18 G  F」まで拾う・Codex r3#5）。
 _GSEP = r"[\s　\-・･.．]"
 # 型番（GF-01 / GP-02）は めっき表記ではないので除外する（監査 A3）。
-_NOT_MODEL = r"(?![0-9a-z])(?!{}*\d)".format(_GSEP)
+# 除外は**ハイフン直結＋数字だけ**に限る。区切りを挟んだ数字まで型番扱いすると
+# 「K18GP 2.5g」「GP 2本セット」のような実在の表記を取り落とす（退行修正）。
+_NOT_MODEL = r"(?![0-9a-z])(?!-\d)"
 _GP_SEP = r"g{}{{0,3}}p{}".format(_GSEP, _NOT_MODEL)
 _GF_SEP = r"g{}{{0,3}}f{}".format(_GSEP, _NOT_MODEL)
 
@@ -213,8 +215,11 @@ APPAREL_DEFAULTS = {
     ],
     "brandSuffixNgWords": list(_BRAND_SUFFIX_NG),
     "brandAliases": dict(_BRAND_ALIASES),
-    "ngPatterns": [],
-    "allowPatterns": (list(_FAKE_NEGATION_PATTERNS) + list(_APOLOGY_PATTERNS) + [
+    # アパレルでも金具・付属パーツの「GP/GF/gold plated」は仕入れ対象外にする
+    # （バッグの金具・ベルトのバックル等。accessory と同じ表記ゆれ対応）。
+    "ngPatterns": list(_PLATING_PATTERNS),
+    "allowPatterns": (list(_FAKE_NEGATION_PATTERNS) + list(_APOLOGY_PATTERNS)
+                      + list(_PLATING_NEGATION_PATTERNS) + [
         r"(?:ダメージ|汚れ|破れ|穴|シミ|染み|虫食い|虫喰い|難|訳|使用感|キズ|傷)"
         + _NSEP + r"(?:は|も)?" + _NSEP + _NEG_TAIL,
     ]),
