@@ -131,28 +131,33 @@ def prefilter(items, profile, history=None, now=None):
         # タイトル一致では弾かない（別出品者の同名出品は「別の仕入れ機会」なので落とすと機会損失）。
         if aid and aid in seen_ids:
             c["excluded_reason"] = "同一実行内の重複(オークションID)"
+            c["excluded_kind"] = "重複(同一実行内)"
             excluded.append(c)
             continue
 
         minutes = c.get("minutes_remaining")
         if minutes is None:
             c["excluded_reason"] = "残り時間不明(終了時刻が取れない)"
+            c["excluded_kind"] = "残り時間不明"
             excluded.append(c)
             continue
         if int(minutes) < min_minutes:
             c["excluded_reason"] = "締切が近すぎる(残り{}分 < {}分)".format(
                 int(minutes), min_minutes)
+            c["excluded_kind"] = "締切が近すぎる(残り{}分未満)".format(min_minutes)
             excluded.append(c)
             continue
         if int(minutes) > max_minutes:
             c["excluded_reason"] = "終了まで遠い(残り{}時間 > {}時間)".format(
                 int(minutes) // 60, max_minutes // 60)
+            c["excluded_kind"] = "終了まで遠い({}時間超)".format(max_minutes // 60)
             excluded.append(c)
             continue
 
         hit = ng_hit(c.get("title"), ng_words, allow_phrases, ng_patterns)
         if hit:
             c["excluded_reason"] = "NG語に該当({})".format(hit)
+            c["excluded_kind"] = "NG語に該当"
             excluded.append(c)
             continue
 
@@ -161,12 +166,14 @@ def prefilter(items, profile, history=None, now=None):
         if total < min_total or total > max_total:
             c["excluded_reason"] = "総額レンジ外({:,}円 / {:,}〜{:,}円)".format(
                 total, min_total, max_total)
+            c["excluded_kind"] = "総額レンジ外({:,}〜{:,}円)".format(min_total, max_total)
             excluded.append(c)
             continue
 
         if history is not None and history.is_duplicate(c):
             c["excluded_reason"] = "直近{}日で既に報告済み(重複)".format(
                 int(profile.get("dedupWindowDays", 7)))
+            c["excluded_kind"] = "過去に報告済み(重複)"
             excluded.append(c)
             continue
 
@@ -181,6 +188,7 @@ def prefilter(items, profile, history=None, now=None):
     if len(kept) > limit:
         for c in kept[limit:]:
             c["excluded_reason"] = "候補数上限({}件)で打ち切り".format(limit)
+            c["excluded_kind"] = "候補数上限で打ち切り"
             excluded.append(c)
         kept = kept[:limit]
 

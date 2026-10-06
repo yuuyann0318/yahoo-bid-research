@@ -199,6 +199,16 @@ def _profile_for(category, args, base_dir=None):
     return ybr_profiles.load_profile(category, base_dir=base_dir, overrides=overrides)
 
 
+
+def _profit_reason_kind(result):
+    """利益判定の不採用理由を集計用の種類に畳む（金額を含めない）。"""
+    reason = (result or {}).get("reason") or "理由不明"
+    for kind in ("相場不明", "入札上限超過", "提案額が下限未満"):
+        if reason.startswith(kind):
+            return kind
+    return reason
+
+
 # --- 本体 ---------------------------------------------------------------------
 def run(argv=None, deps=None, base_dir=None):
     """run サブコマンドの本体。dict（exit_code / payload / paths）を返す。"""
@@ -235,6 +245,19 @@ def run(argv=None, deps=None, base_dir=None):
     notes = []
     degraded = None
     stop_reason = None
+
+    # 指定した利益率がそのまま使えない場合（手数料率との合計が100%以上など）は
+    # 黙って既定へ戻さず、実際に使った値をメモと meta に出す（silent fallback 禁止）。
+    effective_margin = float(args.margin)
+    for _cat, _prof in profiles_by_cat.items():
+        effective_margin = ybr_profit.target_margin_pct(_prof)
+        break
+    if abs(effective_margin - float(args.margin)) > 1e-9:
+        notes.append(
+            "指定した利益率{:.0f}%は使えないため{:.0f}%で計算した"
+            "（手数料率との合計が100%以上、または妥当範囲[{:.0f}〜{:.0f}%]外）".format(
+                float(args.margin), effective_margin,
+                ybr_profit.MIN_TARGET_MARGIN_PCT, ybr_profit.MAX_TARGET_MARGIN_PCT))
     fetcher = deps.get("fetcher")
     throttle_fn = deps.get("throttle_fn")
 
@@ -319,6 +342,7 @@ def run(argv=None, deps=None, base_dir=None):
             comps_clients[cat] = client
         if mercari_budget.remaining() <= 0:
             cand["excluded_reason"] = "メルカリ照会の上限に到達（未照会）"
+            cand["excluded_kind"] = "メルカリ照会の上限で未照会"
             excluded.append(cand)
             continue
         client.fetch(cand)
@@ -326,10 +350,12 @@ def run(argv=None, deps=None, base_dir=None):
         cand["profit"] = result
         if cand.get("comps_error") and not (cand.get("comps") or {}).get("count"):
             cand["excluded_reason"] = ybr_mercari.FETCH_ERROR_REASON
+            cand["excluded_kind"] = ybr_mercari.FETCH_ERROR_REASON
             excluded.append(cand)
             continue
         if not result["ok"]:
             cand["excluded_reason"] = result["reason"]
+            cand["excluded_kind"] = _profit_reason_kind(result)
             excluded.append(cand)
             continue
         adopted.append(cand)
@@ -353,14 +379,16 @@ def run(argv=None, deps=None, base_dir=None):
     if len(adopted) > args.top:
         for c in adopted[args.top:]:
             c["excluded_reason"] = "上位{}件の枠外".format(args.top)
+            c["excluded_kind"] = "上位{}件の枠外".format(args.top)
             excluded.append(c)
         adopted = adopted[:args.top]
 
     history.mark(adopted)
 
+    # 内訳は「種類」で集計する（金額入りの文言でキーが散ると0件の理由が読めない）。
     reasons = {}
     for c in excluded:
-        key = c.get("excluded_reason") or "理由不明"
+        key = c.get("excluded_kind") or c.get("excluded_reason") or "理由不明"
         reasons[key] = reasons.get(key, 0) + 1
 
     if degraded is not None:
@@ -375,7 +403,8 @@ def run(argv=None, deps=None, base_dir=None):
             "generated_at": now.isoformat(),
             "categories": sorted({c for c, _ in jobs}) or [args.category],
             "keywords": [k for _c, k in jobs],
-            "margin_pct": float(args.margin),
+            "margin_pct": effective_margin,
+            "margin_pct_requested": float(args.margin),
             "top": int(args.top),
             "yahoo_requests": yahoo_budget.used,
             "yahoo_items": yahoo_items,

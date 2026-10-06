@@ -152,7 +152,7 @@ fb = 相場クエリの縮退段数（0段 1.00 / 1段 0.95 / 2段 0.90）
 ## 開発
 
 ```bash
-./bin/ybr test        # unittest 156件・ネットワーク不使用
+./bin/ybr test        # unittest 159件・ネットワーク不使用
 ./bin/ybr selftest    # 環境と設定の点検（ネットワーク不使用）
 ```
 

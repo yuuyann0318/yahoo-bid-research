@@ -89,6 +89,23 @@ class TestPipeline(unittest.TestCase):
             self.assertTrue(top["comps"]["query"])
             self.assertTrue(top["mercari_url"].startswith("https://jp.mercari.com/search?"))
 
+    def test_excluded_breakdown_is_grouped_by_kind(self):
+        """実走で発見: 金額入りの理由をそのまま集計するとキーが散って0件の理由が読めない。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            argv = ["--category", "accessory", "--keywords", "ティファニー",
+                    "--out", os.path.join(tmp, "o"), "--state-dir", os.path.join(tmp, "s"),
+                    "--no-cache", "--min-total", "140000", "--max-total", "150000"]
+            res = cli.run(argv, deps=_deps())
+            reasons = res["payload"]["meta"]["excluded_reasons"]
+            self.assertIn("総額レンジ外(140,000〜150,000円)", reasons)
+            self.assertGreaterEqual(reasons["総額レンジ外(140,000〜150,000円)"], 2)
+            # 1件ごとの詳細（金額入り）は candidates.json に残る
+            with open(res["paths"]["json"], encoding="utf-8") as f:
+                data = json.load(f)
+            detailed = [e["excluded_reason"] for e in data["excluded"]
+                        if (e.get("excluded_kind") or "").startswith("総額レンジ外")]
+            self.assertTrue(any("円 / 140,000" in r for r in detailed), detailed[:3])
+
     def test_zero_adopted_exit_2(self):
         with tempfile.TemporaryDirectory() as tmp:
             res = cli.run(_argv(tmp), deps=_deps(adapter=_MercariAdapter(empty=True)))
@@ -191,6 +208,24 @@ class TestPipeline(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             res = cli.run(_argv(tmp, "--margin", "50"), deps=_deps())
             self.assertEqual(res["payload"]["meta"]["margin_pct"], 50.0)
+
+    def test_unusable_margin_is_surfaced_not_silent(self):
+        """実走で発見: --margin 90 は手数料10%と合計100%で使えず30%に戻る。黙って戻さない。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            res = cli.run(_argv(tmp, "--margin", "90"), deps=_deps())
+            meta = res["payload"]["meta"]
+            self.assertEqual(meta["margin_pct"], 30.0)
+            self.assertEqual(meta["margin_pct_requested"], 90.0)
+            self.assertTrue(any("利益率" in n for n in meta["notes"]), meta["notes"])
+            with open(res["paths"]["md"], encoding="utf-8") as f:
+                self.assertIn("指定した利益率", f.read())
+
+    def test_usable_margin_has_no_note(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            res = cli.run(_argv(tmp, "--margin", "40"), deps=_deps())
+            meta = res["payload"]["meta"]
+            self.assertEqual(meta["margin_pct"], 40.0)
+            self.assertFalse(any("指定した利益率" in n for n in meta["notes"]))
 
     def test_invalid_margin_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
