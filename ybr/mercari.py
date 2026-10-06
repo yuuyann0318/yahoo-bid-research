@@ -115,23 +115,31 @@ def sold_search_url(query):
     return _SOLD_SEARCH_BASE + "?" + urllib.parse.urlencode(params)
 
 
-# 括弧の中身が「管理番号」とみなせる形（M14）。
-# これ以外は中身を残して括弧だけ外す（(501) や (B-zero1) のような実在型番を守る）。
+# 括弧の中身が「管理番号」とみなせる形（M14 / Codex r2）。
+# **数字を含むものだけ**を管理番号候補にする。純アルファベット（BURBERRY・ARCTERYX）は残す。
 _MGMT_CODE_RE = re.compile(
     r"^(?:"
-    r"[0-9a-z]*_[0-9a-z_\-]*"       # アンダースコア入り: 12678_0252
-    r"|\d{5,}"                      # 5桁以上の連番
-    r"|[0-9a-z]{8,}"                # 8文字以上の英数字の羅列
-    r"|\d{3,}[-]\d{3,}"             # 1234-5678
+    r"[0-9a-z]*_[0-9a-z_\-]*"           # アンダースコア入り: 12678_0252
+    r"|\d{5,}"                          # 純数字5桁以上: 1234567
+    r"|\d{3,}[-]\d{3,}"                 # 1234-5678
+    r"|(?=.*\d)(?=.*[a-z])[0-9a-z]{8,}"  # 英数混在8文字以上: abc12345xyz
     r")$",
     re.IGNORECASE,
 )
+_HAS_DIGIT_RE = re.compile(r"\d")
+
+
+def _is_management_code(inner):
+    """管理番号と確認できる表記か。数字を含まないものは必ず False（型番・ブランド名を守る）。"""
+    if not _HAS_DIGIT_RE.search(inner or ""):
+        return False
+    return bool(_MGMT_CODE_RE.match(inner))
 
 
 def _strip_brackets(match):
     """括弧の中身が管理番号なら捨て、そうでなければ中身を残す（M14）。"""
     inner = match.group(1)
-    if _MGMT_CODE_RE.match(inner):
+    if _is_management_code(inner):
         return " "
     return " " + inner + " "
 
@@ -228,19 +236,133 @@ def extract_prices(raw_items):
     return prices
 
 
+class MercariBlockedError(RuntimeError):
+    """メルカリ側に 403 / 429 でブロックされた（status を必ず保持する）。
+
+    mercapi 0.4.2 の `Mercapi._search_impl` は `self._client.send()` の戻りの
+    status を見ずに `res.json()` → マッピングするため、403/429 は本文が HTML なら
+    JSONDecodeError、JSON なら ParseAPIResponseError になり **status を持たない**。
+    それでは「ブロック」を検知できないので、httpx の response イベントフックで
+    status を見てこの例外に変換する（H1）。
+    """
+
+    def __init__(self, status, url=None):
+        self.status = int(status)
+        self.status_code = self.status  # _http_status_of からも拾えるように
+        self.url = url
+        super().__init__("メルカリ側にブロックされました(HTTP {})".format(self.status))
+
+
+MERCAPI_CLIENT_ATTR = "_client"
+
+
+def install_block_hook(mercapi_instance):
+    """mercapi 内部の httpx.AsyncClient に response フックを足す（H1）。
+
+    - 403 / 429 → MercariBlockedError（即時中断させる）
+    - 5xx はここでは何もしない（従来どおり解析エラー＝fetch_error として扱う）
+    戻り値: 登録できたら True。内部属性が変わっていたら False（selftest で警告する）。
+    """
+    client = getattr(mercapi_instance, MERCAPI_CLIENT_ATTR, None)
+    hooks = getattr(client, "event_hooks", None)
+    if client is None or not isinstance(hooks, dict):
+        return False
+
+    async def _on_response(response):
+        status = int(getattr(response, "status_code", 0) or 0)
+        if status in BLOCKED_STATUSES:
+            raise MercariBlockedError(status, str(getattr(response, "url", "") or ""))
+
+    try:
+        merged = dict(hooks)
+        merged["request"] = list(merged.get("request") or [])
+        merged["response"] = list(merged.get("response") or []) + [_on_response]
+        client.event_hooks = merged
+    except Exception:  # noqa: BLE001 - httpx の内部仕様変更に耐える
+        return False
+    return bool((getattr(client, "event_hooks", {}) or {}).get("response"))
+
+
+def hook_support_status():
+    """selftest 用: mercapi 内部クライアントへフックを張れるかを実機確認する（KR4）。
+
+    戻り値: (ok: bool, detail: str)。ネットワークは使わない。
+    """
+    try:
+        from mercapi import Mercapi
+    except Exception as e:  # noqa: BLE001
+        return False, "mercapi を import できない: {}".format(e.__class__.__name__)
+    try:
+        instance = Mercapi()
+    except Exception as e:  # noqa: BLE001
+        return False, "Mercapi() を生成できない: {}".format(e.__class__.__name__)
+    client = getattr(instance, MERCAPI_CLIENT_ATTR, None)
+    if client is None:
+        return False, "内部クライアント属性 {} が無い（mercapi の仕様変更）".format(
+            MERCAPI_CLIENT_ATTR)
+    if not install_block_hook(instance):
+        return False, "response フックを登録できない（httpx の仕様変更）"
+    return True, "{}.event_hooks['response'] に登録成功".format(MERCAPI_CLIENT_ATTR)
+
+
 class MercapiAdapter:
-    """実 mercapi を遅延importして売切検索する本番アダプタ。"""
+    """実 mercapi を遅延importして売切検索する本番アダプタ。
+
+    検索ごとに Mercapi を作り直す（asyncio.run が毎回新しいループを作るため）。
+    作った直後に install_block_hook() で 403/429 検出フックを張る。
+    """
+
+    def __init__(self):
+        self.hook_installed = None  # 直近の検索でフックを張れたか（None=未実施）
 
     def search(self, query):
         from mercapi import Mercapi  # 遅延import（未インストールは例外→取得失敗として扱う）
         from mercapi.requests.search import SearchRequestData
 
+        adapter = self
+
         async def _run():
             mc = Mercapi()
+            adapter.hook_installed = install_block_hook(mc)
             res = await mc.search(query, status=[SearchRequestData.Status.STATUS_SOLD_OUT])
             return list(res.items)
 
         return asyncio.run(_run())
+
+
+class MercariState:
+    """メルカリ照会の中断状態と連続失敗数を**実行全体で**共有する（H2）。
+
+    カテゴリ別に持つと、403 を受けた後に別カテゴリがまた照会してしまう。
+    """
+
+    def __init__(self, max_consecutive=MAX_CONSECUTIVE_FAILURES):
+        self.max_consecutive = int(max_consecutive)
+        self.blocked = False
+        self.blocked_status = None
+        self.aborted = False
+        self.last_error = None
+        self.consecutive_failures = 0
+        self.fetch_failures = 0
+
+    def record_success(self):
+        self.consecutive_failures = 0
+
+    def record_failure(self, error_text):
+        self.fetch_failures += 1
+        self.consecutive_failures += 1
+        self.last_error = error_text
+        if self.consecutive_failures >= self.max_consecutive:
+            self.aborted = True
+        return self.consecutive_failures
+
+    def record_blocked(self, status):
+        self.blocked = True
+        self.blocked_status = int(status)
+        self.aborted = True
+
+    def stopped(self):
+        return self.blocked or self.aborted
 
 
 def _http_status_of(error):
@@ -278,12 +400,15 @@ class MercariComps:
       aborted / blocked / budget_exhausted / no_query を必ず入れる。
     """
 
-    def __init__(self, profile, cache, adapter=None, budget=None, throttle_fn=None):
+    def __init__(self, profile, cache, adapter=None, budget=None, throttle_fn=None,
+                 state=None):
         self.profile = profile or {}
         self.cache = cache
         self.adapter = adapter if adapter is not None else MercapiAdapter()
         self.budget = budget
         self.throttle_fn = throttle_fn or throttle_module.throttle
+        # 中断状態・連続失敗数は実行全体で共有する（H2）。省略時は自前で持つ。
+        self.state = state if state is not None else MercariState()
         try:
             self.min_interval = float(self.profile.get("mercariMinIntervalSec", 2.5))
         except (TypeError, ValueError):
@@ -293,17 +418,32 @@ class MercariComps:
         self.valid_comps = 0
         self.cache_hits = 0
         self.budget_exhausted = False
-        self.fetch_failures = 0
-        self.aborted = False
-        self.blocked = False
-        self.blocked_status = None
-        self.last_error = None
-        self._consecutive_failures = 0
 
     # 後方互換（旧名）。意味は「有効相場の件数」。
     @property
     def successes(self):
         return self.valid_comps
+
+    # 中断状態は共有 state を参照する（カテゴリをまたいで効く）
+    @property
+    def aborted(self):
+        return self.state.aborted
+
+    @property
+    def blocked(self):
+        return self.state.blocked
+
+    @property
+    def blocked_status(self):
+        return self.state.blocked_status
+
+    @property
+    def last_error(self):
+        return self.state.last_error
+
+    @property
+    def fetch_failures(self):
+        return self.state.fetch_failures
 
     def _comps_from_stats(self, stats, query, level, cache_hit):
         """統計 + 「今回の」縮退段数から comps を組む（C1）。"""
@@ -332,17 +472,20 @@ class MercariComps:
             return self._fail(candidate, "no_query", "相場クエリを作れなかった(タイトルから語が取れない)")
         first_query = attempts[0][1]
 
-        if self.blocked:
+        # 中断状態は共有（H2）。403のあとは別カテゴリの候補も照会しない。
+        if self.state.blocked:
             return self._fail(
                 candidate, "blocked",
-                "メルカリ側にブロックされ照会中断(HTTP {})".format(self.blocked_status),
+                "メルカリ側にブロックされ照会中断(HTTP {})".format(self.state.blocked_status),
                 first_query)
-        if self.aborted:
+        if self.state.aborted:
             return self._fail(
                 candidate, "aborted",
-                self.last_error or "連続失敗により照会中断", first_query)
+                self.state.last_error or "連続失敗により照会中断", first_query)
 
         for level, query in attempts:
+            # M: キャッシュ確認を**予算判定より先に**行う（キャッシュ命中は予算を消費せず、
+            # budget_exhausted にもしない）。
             cached = self.cache.get(query)
             if cached is not None:
                 comps = self._comps_from_stats(cached, query, level, True)
@@ -366,25 +509,23 @@ class MercariComps:
             try:
                 raw_items = self.adapter.search(query)
             except Exception as e:  # noqa: BLE001 - mercapi不在/通信障害=相場取得不能
-                self.fetch_failures += 1
-                self._consecutive_failures += 1
-                self.last_error = "{}: {}".format(e.__class__.__name__, str(e)[:120])
-                status = _http_status_of(e)
+                error_text = "{}: {}".format(e.__class__.__name__, str(e)[:120])
+                status = e.status if isinstance(e, MercariBlockedError) else _http_status_of(e)
                 if status in BLOCKED_STATUSES:
-                    self.blocked = True
-                    self.blocked_status = status
-                    self.aborted = True
+                    self.state.fetch_failures += 1
+                    self.state.last_error = error_text
+                    self.state.record_blocked(status)
                     return self._fail(
                         candidate, "blocked",
                         "メルカリ側にブロックされました(HTTP {})".format(status), first_query)
-                if self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                    self.aborted = True
+                consecutive = self.state.record_failure(error_text)
+                if self.state.aborted:
                     return self._fail(
                         candidate, "aborted",
-                        "{}回連続で失敗し照会中断({})".format(
-                            self._consecutive_failures, self.last_error), first_query)
-                return self._fail(candidate, "fetch_error", self.last_error, first_query)
-            self._consecutive_failures = 0
+                        "{}回連続で失敗し照会中断({})".format(consecutive, error_text),
+                        first_query)
+                return self._fail(candidate, "fetch_error", error_text, first_query)
+            self.state.record_success()
             self.http_successes += 1
 
             prices = extract_prices(raw_items)

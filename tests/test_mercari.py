@@ -454,6 +454,220 @@ class TestBlockedAndCounters(unittest.TestCase):
         self.assertEqual(mc2.successes, 1)  # 後方互換の別名
 
 
+class TestBlockHookInstall(unittest.TestCase):
+    """H1: mercapi 0.4.2 は 403/429 を status 付き例外にしないので、httpx の
+    response フックで status を見てブロック扱いにする。"""
+
+    def _client(self, status):
+        import httpx
+
+        def handler(_request):
+            return httpx.Response(status, text="<html>blocked</html>")
+
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    def _send(self, status):
+        import asyncio
+
+        class FakeMercapi:
+            pass
+
+        obj = FakeMercapi()
+        setattr(obj, mercari.MERCAPI_CLIENT_ATTR, self._client(status))
+        installed = mercari.install_block_hook(obj)
+        client = getattr(obj, mercari.MERCAPI_CLIENT_ATTR)
+
+        async def _run():
+            try:
+                await client.send(client.build_request("GET", "https://example.invalid/x"))
+                return None
+            finally:
+                await client.aclose()
+
+        return installed, _run
+
+    def test_hook_raises_on_403(self):
+        import asyncio
+        installed, run = self._send(403)
+        self.assertTrue(installed)
+        with self.assertRaises(mercari.MercariBlockedError) as cm:
+            asyncio.run(run())
+        self.assertEqual(cm.exception.status, 403)
+
+    def test_hook_raises_on_429(self):
+        import asyncio
+        _installed, run = self._send(429)
+        with self.assertRaises(mercari.MercariBlockedError) as cm:
+            asyncio.run(run())
+        self.assertEqual(cm.exception.status, 429)
+
+    def test_hook_passes_200(self):
+        import asyncio
+        _installed, run = self._send(200)
+        self.assertIsNone(asyncio.run(run()))
+
+    def test_hook_passes_500_to_normal_error_path(self):
+        """5xx はここでは止めない（従来どおり解析エラー＝fetch_error 扱い）。"""
+        import asyncio
+        _installed, run = self._send(500)
+        self.assertIsNone(asyncio.run(run()))
+
+    def test_install_returns_false_without_client(self):
+        class NoClient:
+            pass
+
+        self.assertFalse(mercari.install_block_hook(NoClient()))
+
+    def test_install_returns_false_when_hooks_missing(self):
+        class Weird:
+            pass
+
+        obj = Weird()
+        setattr(obj, mercari.MERCAPI_CLIENT_ATTR, object())
+        self.assertFalse(mercari.install_block_hook(obj))
+
+    def test_hook_support_status_on_real_mercapi(self):
+        """実環境で mercapi の内部属性にフックを張れることを確認（KR4）。"""
+        try:
+            import mercapi  # noqa: F401
+        except Exception:  # pragma: no cover
+            self.skipTest("mercapi 未インストール")
+        ok, detail = mercari.hook_support_status()
+        self.assertTrue(ok, detail)
+        self.assertIn("event_hooks", detail)
+
+    def test_blocked_error_carries_status_for_detection(self):
+        """旧方式（response.status_code）でも拾えるように status_code も持たせる。"""
+        e = mercari.MercariBlockedError(403)
+        self.assertEqual(mercari._http_status_of(e), 403)
+
+    def test_comps_treats_blocked_error_as_blocked(self):
+        class AD:
+            def search(self, _q):
+                raise mercari.MercariBlockedError(429)
+
+        p = build_profile("accessory", {})
+        mc = mercari.MercariComps(p, NullCompsCache(), adapter=AD(),
+                                  throttle_fn=lambda _s: None)
+        cand = {"title": "テスト 商品", "keyword": "テスト"}
+        mc.fetch(cand)
+        self.assertEqual(cand["comps_status"], "blocked")
+        self.assertEqual(mc.blocked_status, 429)
+
+    def test_statusless_error_is_fetch_error_not_blocked(self):
+        """mercapi が status を持たない例外（ParseAPIResponseError 相当）を投げた場合、
+        ブロックと誤認せず fetch_error にする（検出はフックの責任）。"""
+        class ParseAPIResponseError(Exception):
+            pass
+
+        class AD:
+            def search(self, _q):
+                raise ParseAPIResponseError("Failed to parse response")
+
+        p = build_profile("accessory", {})
+        mc = mercari.MercariComps(p, NullCompsCache(), adapter=AD(),
+                                  throttle_fn=lambda _s: None)
+        cand = {"title": "テスト 商品", "keyword": "テスト"}
+        mc.fetch(cand)
+        self.assertEqual(cand["comps_status"], "fetch_error")
+        self.assertFalse(mc.blocked)
+
+    def test_real_adapter_records_hook_installed_flag(self):
+        self.assertIsNone(mercari.MercapiAdapter().hook_installed)
+
+
+class TestSharedState(unittest.TestCase):
+    """H2: 中断状態と連続失敗数を実行全体で共有する（カテゴリをまたいで効く）。"""
+
+    def setUp(self):
+        self.acc = build_profile("accessory", {})
+        self.app = build_profile("apparel", {})
+
+    def _clients(self, adapter):
+        state = mercari.MercariState()
+        a = mercari.MercariComps(self.acc, NullCompsCache(), adapter=adapter,
+                                 throttle_fn=lambda _s: None, state=state)
+        b = mercari.MercariComps(self.app, NullCompsCache(), adapter=adapter,
+                                 throttle_fn=lambda _s: None, state=state)
+        return state, a, b
+
+    def test_block_in_one_category_stops_the_other(self):
+        class AD:
+            calls = 0
+
+            def search(self, _q):
+                AD.calls += 1
+                raise mercari.MercariBlockedError(403)
+
+        ad = AD()
+        state, a, b = self._clients(ad)
+        a.fetch({"title": "ティファニー リング", "keyword": "ティファニー"})
+        cand = {"title": "バーバリー コート", "keyword": "バーバリー"}
+        b.fetch(cand)
+        self.assertEqual(AD.calls, 1, "403後に別カテゴリが照会している")
+        self.assertEqual(cand["comps_status"], "blocked")
+        self.assertTrue(state.blocked)
+
+    def test_consecutive_failures_count_across_categories(self):
+        class AD:
+            calls = 0
+
+            def search(self, _q):
+                AD.calls += 1
+                raise RuntimeError("down")
+
+        ad = AD()
+        state, a, b = self._clients(ad)
+        a.fetch({"title": "ティファニー リング", "keyword": "ティファニー"})
+        b.fetch({"title": "バーバリー コート", "keyword": "バーバリー"})
+        cand = {"title": "モンクレール ダウン", "keyword": "モンクレール"}
+        a.fetch(cand)
+        self.assertTrue(state.aborted, "カテゴリをまたいだ連続失敗で中断していない")
+        self.assertEqual(AD.calls, 3)
+        self.assertEqual(cand["comps_status"], "aborted")
+
+    def test_success_resets_shared_counter(self):
+        class AD:
+            def __init__(self):
+                self.n = 0
+
+            def search(self, _q):
+                self.n += 1
+                if self.n == 2:
+                    return [_Item(1000), _Item(2000), _Item(3000)]
+                raise RuntimeError("flaky")
+
+        state, a, b = self._clients(AD())
+        a.fetch({"title": "ティファニー リング", "keyword": "ティファニー"})
+        b.fetch({"title": "バーバリー コート", "keyword": "バーバリー"})
+        self.assertEqual(state.consecutive_failures, 0)
+        self.assertFalse(state.aborted)
+
+
+class TestBudgetAfterCache(unittest.TestCase):
+    """Codex r2: 予算判定はキャッシュ確認の後（キャッシュ命中は予算を消費しない）。"""
+
+    def test_cache_hit_does_not_need_budget(self):
+        cache = _DictCache()
+        cache.put("テスト 商品", {"count": 10, "median": 5000, "p25": 4500,
+                                 "p75": 5500, "min": 4000, "max": 6000, "mean": 5000})
+        p = build_profile("accessory", {})
+        spent = []
+
+        def budget(n):
+            spent.append(n)
+            return False  # 予算ゼロ
+
+        mc = mercari.MercariComps(p, cache, adapter=_Adapter({}), budget=budget,
+                                  throttle_fn=lambda _s: None)
+        cand = {"title": "テスト 商品", "keyword": "テスト"}
+        comps = mc.fetch(cand)
+        self.assertIsNotNone(comps, "キャッシュ命中なのに予算切れで落ちている")
+        self.assertEqual(cand["comps_status"], "ok")
+        self.assertFalse(mc.budget_exhausted)
+        self.assertEqual(spent, [])
+
+
 class TestTokenizeFixes(unittest.TestCase):
     """M14 / M15: 括弧付き型番の保持と全角トークンの正規化。"""
 
@@ -468,6 +682,25 @@ class TestTokenizeFixes(unittest.TestCase):
         qa = mercari.build_queries(
             {"title": "ブルガリ (B-zero1) リング", "keyword": "ブルガリ"}, self.acc)
         self.assertIn("B-zero1", qa[0][1])
+
+    def test_pure_alphabet_brackets_are_kept(self):
+        """Codex r2: 括弧内の純アルファベット（BURBERRY/ARCTERYX）を消さない。"""
+        for brand in ("BURBERRY", "ARCTERYX", "SUPREME", "NIKE"):
+            q = mercari.build_queries(
+                {"title": "コート (%s) ノバチェック" % brand, "keyword": "バーバリー"},
+                self.app)
+            self.assertIn(brand, q[0][1], brand)
+
+    def test_management_code_detection_requires_digits(self):
+        self.assertFalse(mercari._is_management_code("BURBERRY"))
+        self.assertFalse(mercari._is_management_code("ARCTERYX"))
+        self.assertFalse(mercari._is_management_code("Bzero"))
+        self.assertTrue(mercari._is_management_code("12678_0252"))
+        self.assertTrue(mercari._is_management_code("1234567"))
+        self.assertTrue(mercari._is_management_code("abc12345xyz"))
+        self.assertTrue(mercari._is_management_code("1234-5678"))
+        self.assertFalse(mercari._is_management_code("501"))
+        self.assertFalse(mercari._is_management_code("B-zero1"))
 
     def test_management_codes_in_parens_are_removed(self):
         for code in ("(12678_0252)", "(1234567)", "(abc12345xyz)", "(1234-5678)"):

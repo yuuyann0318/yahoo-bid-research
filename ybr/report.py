@@ -19,14 +19,21 @@ import re
 from datetime import datetime
 
 _CTRL_RE = re.compile("[\\x00-\\x1f\\x7f\\u2028\\u2029]")
-# 大文字スキーム（HTTPS://）でも除去する（m20 / Codex#14）
-_URL_IN_TEXT_RE = re.compile(r"(?i)\b(?:https?|ftp)://\S+")
+# 大文字スキーム（HTTPS://）でも、日本語に直結した「正規品HTTPS://…」でも除去する。
+# `\b` は Unicode の単語境界なので日本語直結だとマッチしない（Codex r2）→ 使わない。
+_URL_IN_TEXT_RE = re.compile(r"(?i)(?<![a-z])(?:https?|ftp)://\S+")
+# URL除去後に残る括弧片・山括弧（<HTTPS://…> の名残）を落とす（監査#5）
+_BRACKET_REMNANT_RE = re.compile(r"[<>＜＞]")
 # CSV の数式インジェクション対策（m20 / Codex#13）。先頭がこれらの文字なら無害化する。
 _CSV_FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
 
 # メルカリ検索は完全一致ではなく関連度順のため、件数が多いときは
 # 「別物まで混ざった相場」になりうる。その場合は注意として明示する（実走で確認）。
 LOOSE_MATCH_COUNT = 60
+
+# 件数が少ない（確度「低」側）のに予想売値が現在総額から離れすぎているときの注意（監査提案）。
+DIVERGENCE_MIN_COUNT = 8   # n がこれ未満のときだけ見る
+DIVERGENCE_RATIO = 3.0     # 予想売値 / 現在総額 がこれを超えたら注意
 
 MD_NAME = "result.md"
 CSV_NAME = "result.csv"
@@ -58,8 +65,9 @@ def sanitize_text(text):
 
 
 def safe_title(title):
-    """タイトルを1行化し、混入した URL を除去する（偽リンク行の注入防止）。"""
+    """タイトルを1行化し、混入した URL と括弧片を除去する（偽リンク行の注入防止）。"""
     text = _URL_IN_TEXT_RE.sub(" ", sanitize_text(title))
+    text = _BRACKET_REMNANT_RE.sub(" ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text or "(タイトル不明)"
 
@@ -154,6 +162,16 @@ def _notes(candidate):
     if int(comps.get("count") or 0) >= LOOSE_MATCH_COUNT:
         notes.append("相場n{}件と多い(関連度検索で別物混入の可能性→相場URLを目視確認)".format(
             comps.get("count")))
+    # 件数が少ないのに現在価格と予想売値が離れすぎている＝別物を拾った疑い（監査提案）。
+    # 採用は維持し、注意だけ付ける（実例: Supreme Nuptse Bear のぬいぐるみ混入）。
+    expected = profit.get("expected_sale")
+    total = candidate.get("total_cost") or candidate.get("price")
+    count = int(comps.get("count") or 0)
+    if (expected and total and count and count < DIVERGENCE_MIN_COUNT
+            and expected > total * DIVERGENCE_RATIO):
+        notes.append(
+            "乖離大・別物クエリ疑い(n{}件で予想売値が現在総額の{:.1f}倍→相場URLを目視)".format(
+                count, expected / float(total)))
     if candidate.get("is_store"):
         notes.append("ストア出品")
     for w in candidate.get("cautions") or []:

@@ -289,11 +289,17 @@ def search_keyword(keyword, pages=1, per=100, fetcher=None, spend=None, now=None
     - ConsecutiveFailureError も同様に再送出する（m22）。
     - ページは取れたのにパース0件なら warning="構造変化の疑い: <keyword>"。
     """
+    # 失敗の計上責任を分ける（Codex r2 Medium）:
+    #   本番 fetcher … default_fetcher が **HTTP試行ごとに1回** 計上する
+    #   注入 fetcher … ここで1回だけ計上する
+    # 両方で数えると、予算でリトライが途切れたとき実HTTP2回で「連続3回」になる。
     if fetcher is not None:
         fetch = fetcher
+        count_here = True
     else:
         def fetch(url):
             return default_fetcher(url, spend=spend, tracker=tracker)
+        count_here = False
 
     items = []
     seen_ids = set()
@@ -313,7 +319,7 @@ def search_keyword(keyword, pages=1, per=100, fetcher=None, spend=None, now=None
             # 注入された fetcher が素の HTTPError を投げても BlockedError に正規化する
             if int(getattr(e, "code", 0)) in BLOCKED_STATUS:
                 raise BlockedError(e.code, url)
-            if tracker is not None:
+            if tracker is not None and count_here:
                 tracker.record_failure(e)
                 if tracker.exceeded():
                     raise ConsecutiveFailureError(tracker.consecutive, tracker.last_error)
@@ -321,14 +327,14 @@ def search_keyword(keyword, pages=1, per=100, fetcher=None, spend=None, now=None
                 raise
             break
         except Exception as e:  # noqa: BLE001 - 通信断等
-            if tracker is not None:
+            if tracker is not None and count_here:
                 tracker.record_failure(e)
                 if tracker.exceeded():
                     raise ConsecutiveFailureError(tracker.consecutive, tracker.last_error)
             if pages_fetched == 0:
                 raise
             break  # 取得済み分は活かす
-        if tracker is not None:
+        if tracker is not None and count_here:
             tracker.record_success()
         pages_fetched += 1
         page_items = parse_items(page_html, keyword, now=now)

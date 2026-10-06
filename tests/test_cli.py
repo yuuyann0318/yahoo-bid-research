@@ -349,6 +349,127 @@ class TestBlockedPropagation(unittest.TestCase):
             self.assertEqual(len(calls), 3, "3回連続失敗で止まっていない")
 
 
+class TestRealMercariBlockPath(unittest.TestCase):
+    """H1/KR2: mercapi の 403 を MercariBlockedError で受けて exit3＋バナー。"""
+
+    def test_mercapi_blocked_error_gives_exit3_and_banner(self):
+        from ybr import mercari as ybr_mercari
+
+        class AD:
+            calls = 0
+
+            def search(self, _q):
+                AD.calls += 1
+                raise ybr_mercari.MercariBlockedError(403)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            res = cli.run(_argv(tmp, "--no-history"), deps=_deps(adapter=AD()))
+            self.assertEqual(res["exit_code"], 3)
+            meta = res["payload"]["meta"]
+            self.assertEqual(meta["mercari_blocked_status"], 403)
+            self.assertIn("403", meta["degraded"])
+            md = _md(res)
+            self.assertIn("⚠️", md)
+            self.assertIn("403", md)
+            self.assertEqual(AD.calls, 1, "403のあとも照会を続けている")
+
+    def test_blocked_stops_both_categories(self):
+        """H2: カテゴリをまたいで止まる。"""
+        from ybr import mercari as ybr_mercari
+
+        class AD:
+            calls = 0
+
+            def search(self, _q):
+                AD.calls += 1
+                raise ybr_mercari.MercariBlockedError(429)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            argv = ["--category", "both",
+                    "--out", os.path.join(tmp, "o"), "--state-dir", os.path.join(tmp, "s"),
+                    "--no-cache", "--no-history", "--max-yahoo-requests", "2",
+                    "--max-mercari-requests", "20"]
+            res = cli.run(argv, deps=_deps(adapter=AD()))
+            self.assertEqual(res["exit_code"], 3)
+            self.assertEqual(AD.calls, 1)
+            kinds = res["payload"]["meta"]["excluded_reasons"]
+            self.assertTrue([k for k in kinds if "ブロック" in k], kinds)
+
+    def test_statusless_mercapi_error_is_not_reported_as_blocked(self):
+        class ParseAPIResponseError(Exception):
+            pass
+
+        class AD:
+            def search(self, _q):
+                raise ParseAPIResponseError("Failed to parse response")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            res = cli.run(_argv(tmp, "--no-history"), deps=_deps(adapter=AD()))
+            self.assertEqual(res["exit_code"], 3)
+            self.assertIsNone(res["payload"]["meta"]["mercari_blocked_status"])
+            self.assertIn("連続", res["payload"]["meta"]["degraded"])
+
+
+class TestBothLimitsAtOnce(unittest.TestCase):
+    """H4: 実行上限と日次上限が同時に尽きても日次到達を記録し exit3・履歴なし。"""
+
+    def test_budget_records_daily_even_when_run_limit_also_hit(self):
+        from ybr.cache import DailyBudget
+        with tempfile.TemporaryDirectory() as tmp:
+            daily = DailyBudget(os.path.join(tmp, "b.json"), limits={"yahoo": 1})
+            b = cli._Budget("yahoo", 1, daily)
+            self.assertTrue(b.spend(1))
+            self.assertFalse(b.spend(1))
+            self.assertTrue(b.hit_daily_limit, "日次到達が記録されていない")
+            self.assertTrue(b.hit_run_limit)
+            self.assertIn("日次上限", b.block_reason())
+
+    def test_run_limit_only_does_not_set_daily(self):
+        from ybr.cache import DailyBudget
+        with tempfile.TemporaryDirectory() as tmp:
+            daily = DailyBudget(os.path.join(tmp, "b.json"), limits={"yahoo": 100})
+            b = cli._Budget("yahoo", 1, daily)
+            self.assertTrue(b.spend(1))
+            self.assertFalse(b.spend(1))
+            self.assertFalse(b.hit_daily_limit)
+            self.assertIn("1実行の上限", b.block_reason())
+
+    def test_simultaneous_limits_give_exit3_and_no_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = os.path.join(tmp, "s")
+            base = ["--category", "accessory", "--state-dir", state, "--no-cache",
+                    "--max-yahoo-per-day", "2", "--max-yahoo-requests", "1"]
+            r1 = cli.run(base + ["--out", os.path.join(tmp, "o1")], deps=_deps())
+            self.assertEqual(r1["exit_code"], 0)
+            self.assertTrue(os.path.exists(os.path.join(state, "history.json")))
+            os.remove(os.path.join(state, "history.json"))
+            # 2本目: 1実行上限1回 と 日次残り1回 が同時に尽きる
+            r2 = cli.run(base + ["--out", os.path.join(tmp, "o2")], deps=_deps())
+            self.assertEqual(r2["exit_code"], 3, r2["payload"]["meta"])
+            self.assertIn("日次上限", r2["payload"]["meta"]["degraded"])
+            self.assertFalse(os.path.exists(os.path.join(state, "history.json")),
+                             "exit3 なのに履歴を保存している")
+
+
+class TestCachedCandidateSurvivesBudget(unittest.TestCase):
+    """Codex r2: 有効キャッシュのある候補を budget_exhausted で落とさない。"""
+
+    def test_cached_candidate_is_adopted_with_zero_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = os.path.join(tmp, "s")
+            base = ["--category", "accessory", "--keywords", "ティファニー オープンハート",
+                    "--state-dir", state, "--no-history"]
+            r1 = cli.run(base + ["--out", os.path.join(tmp, "o1"),
+                                 "--max-mercari-requests", "20"], deps=_deps())
+            self.assertGreaterEqual(len(r1["payload"]["adopted"]), 1)
+            # 2本目は mercari 予算1回だけ。キャッシュ命中なら予算を使わず採用される
+            r2 = cli.run(base + ["--out", os.path.join(tmp, "o2"),
+                                 "--max-mercari-requests", "1"], deps=_deps())
+            meta = r2["payload"]["meta"]
+            self.assertGreater(meta["mercari_cache_hits"], 0, meta)
+            self.assertGreaterEqual(len(r2["payload"]["adopted"]), 1, meta)
+
+
 class TestUnqueriedVsZeroHits(unittest.TestCase):
     """C3: 「売切0件」と「未照会」を混ぜない。"""
 

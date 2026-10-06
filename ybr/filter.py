@@ -88,15 +88,25 @@ def _covered(span, allow_spans):
 
 
 def _ng_hit_in(hay, ng_words, allow_phrases, ng_patterns, allow_patterns=()):
+    """NG語/NGパターンの出現を**長いものから**判定する（監査#2）。
+
+    短い語を先に見ると「スーパーコピーではありません」で `コピー` が救済され、
+    そのあと `スーパーコピー` がNGになる（救済が効かない）。長い出現から見れば
+    救済パターンが覆っているかを正しく判定できる。
+    """
     allowed = _allow_spans(hay, allow_phrases, allow_patterns)
+    occurrences = []
     for word in ng_words or ():
         for span in _spans_of_word(hay, word):
-            if not _covered(span, allowed):
-                return word
+            occurrences.append((span[1] - span[0], span, word))
     for pattern in ng_patterns or ():
         for span in _spans_of_pattern(hay, pattern):
-            if not _covered(span, allowed):
-                return hay[span[0]:span[1]]
+            occurrences.append((span[1] - span[0], span, hay[span[0]:span[1]]))
+    # 長い出現を優先（同長なら出現順）
+    occurrences.sort(key=lambda item: (-item[0], item[1][0]))
+    for _length, span, label in occurrences:
+        if not _covered(span, allowed):
+            return label
     return None
 
 
@@ -139,7 +149,9 @@ def ng_hit(title, ng_words, allow_phrases=(), ng_patterns=(),
     if hit:
         return hit
 
-    # 区切り挿入による迂回対策（カタカナNG語だけ・Codex#5）
+    # 区切り挿入による迂回対策（「レ プ リ カ」「コ・ピー」・Codex#5）。
+    # 救済（allowPhrases / allowPatterns）も**同じ** stripped 文字列に対して適用する
+    # （渡し忘れると「ティファニー レプリカじゃない」が除外される・Codex r2）。
     kana_ng = [w for w in (ng_words or ()) if _KATAKANA_RE.search(str(w))]
     if kana_ng:
         hay_nosep = strip_separators(hay)
@@ -149,6 +161,7 @@ def ng_hit(title, ng_words, allow_phrases=(), ng_patterns=(),
                 [strip_separators(normalize_for_match(w)) for w in kana_ng],
                 [strip_separators(normalize_for_match(p)) for p in (allow_phrases or ())],
                 (),
+                allow_patterns=allow_patterns,  # 正規表現は \s* 任意なので素のまま使える
             )
             if hit:
                 return hit

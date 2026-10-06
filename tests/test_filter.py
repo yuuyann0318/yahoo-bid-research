@@ -137,6 +137,76 @@ class TestNgHit(unittest.TestCase):
     def test_standalone_fu_word_is_not_ng(self):
         self.assertIsNone(self._app("北欧 インテリア 扇風機 カバー"))
 
+    # --- Codex r2: 二重否定・断定できない否定は救済しない ---
+    def test_double_negation_is_not_rescued(self):
+        self.assertIsNotNone(self._acc("K18GFじゃないわけではない"))
+        self.assertIsNotNone(self._acc("GPではないわけではありません"))
+
+    def test_apparel_double_negation_is_not_rescued(self):
+        self.assertIsNotNone(self._app("ニット 虫食いはなくはない"))
+        self.assertIsNotNone(self._app("デニム ダメージはなくはない"))
+
+    def test_plain_negation_is_still_rescued(self):
+        self.assertIsNone(self._acc("シルバー925 GPではありません"))
+        self.assertIsNone(self._app("ニット 虫食いはありません"))
+        self.assertIsNone(self._app("デニム ダメージはありません"))
+
+    def test_shohin_negation_is_rescued(self):
+        """監査#2: 「コピー商品ではない」を救済する。"""
+        self.assertIsNone(self._app("バーバリー コピー商品ではないので安心"))
+        self.assertIsNone(self._acc("ティファニー コピー品ではありません"))
+
+    def test_longest_ng_occurrence_is_rescued(self):
+        """監査#2: 短い語だけ救済して長い語でNGになる取りこぼしを防ぐ。"""
+        self.assertIsNone(self._app("バーバリー スーパーコピーではありません"))
+        self.assertIsNone(self._acc("ティファニー スーパーコピーではありません"))
+
+    # --- Codex r2: ASCII の区切り挿入（G-P / G F） ---
+    def test_ascii_separated_gp_is_detected(self):
+        for title in ("K18 G-P ネックレス", "SV925 G・P リング", "18K G P チェーン",
+                      "ネックレス G-P 刻印", "リング G・F"):
+            self.assertIsNotNone(self._acc(title), title)
+
+    def test_gps_and_normal_words_are_not_hit_by_separated_pattern(self):
+        for title in ("ガーミン GPS ウォッチ", "G-SHOCK 腕時計", "ティファニー GF刻印なし 本物"):
+            result = self._acc(title)
+            if title.startswith("ガーミン") or title.startswith("G-SHOCK"):
+                self.assertIsNone(result, title)
+
+    def test_separated_gp_negation_is_rescued(self):
+        self.assertIsNone(self._acc("K18 G-Pではありません"))
+
+    # --- Codex r2: 区切り除去後の再照合にも救済を適用 ---
+    def test_separator_stripped_pass_applies_rescue(self):
+        self.assertIsNone(self._acc("ティファニー レプリカじゃない"))
+        self.assertIsNone(self._app("バーバリー レ プ リ カ ではありません"))
+
+    def test_spaced_negation_is_rescued(self):
+        self.assertIsNone(self._app("デニム ダメージ は ありません"))
+
+    def test_separator_stripped_pass_still_detects(self):
+        self.assertIsNotNone(self._acc("ティファニー レ プ リ カ 品"))
+
+    # --- Codex r2: ブランドの英語表記でも模倣表現を検出 ---
+    def test_english_brand_suffix_is_ng(self):
+        # 英綴りは brandAliases → brandTerms 経由で入る。カテゴリの検索語に居るブランドだけ。
+        self.assertIsNotNone(self._acc("TIFFANY風 ネックレス"))
+        self.assertIsNotNone(self._acc("GUCCIタイプ ネックレス"))
+        self.assertIsNotNone(self._acc("Cartier調 リング"))
+        self.assertIsNotNone(self._app("BURBERRY風 トレンチコート"))
+        self.assertIsNotNone(self._app("MONCLERタイプ ダウン"))
+
+    def test_union_profile_covers_both_languages(self):
+        """カテゴリ不明の語では両カテゴリの英綴りが効く（M11との組合せ）。"""
+        from ybr.profiles import load_union_profile
+        u = load_union_profile()
+        for title in ("GUCCIタイプ ネックレス", "BURBERRY風 コート"):
+            self.assertIsNotNone(self._hit(u, title), title)
+
+    def test_english_brand_without_suffix_is_kept(self):
+        self.assertIsNone(self._app("BURBERRY LONDON トレンチコート 英国製"))
+        self.assertIsNone(self._acc("TIFFANY&Co. オープンハート 正規"))
+
     # --- M10/M12/M23: アパレル語彙の修正 ---
     def test_remake_is_ng(self):
         self.assertIsNotNone(self._app("リーバイス リメイク デニムスカート"))
@@ -155,10 +225,12 @@ class TestNgHit(unittest.TestCase):
             self.assertEqual(
                 ybr_filter.caution_hits(title, self.app["cautionWords"]), [], title)
 
-    def test_damage_sukoshi_is_not_rescued_and_is_caution(self):
-        """M12: 「ダメージ少」は救済語ではなく注意語。"""
+    def test_damage_sukoshi_is_ng_not_rescued(self):
+        """M12 + 監査#3: 「ダメージ少」は救済しない。cautionWords にも置かない
+        （ngWords『ダメージ』に先に当たるので到達不能＝嘘の設定になる）。"""
         self.assertNotIn("ダメージ少", self.app["allowPhrases"])
-        self.assertIn("ダメージ少", self.app["cautionWords"])
+        self.assertNotIn("ダメージ少", self.app["cautionWords"])
+        self.assertNotIn("ダメージ少なめ", self.app["cautionWords"])
         self.assertIsNotNone(self._app("リーバイス ダメージ少なめ"))
 
 

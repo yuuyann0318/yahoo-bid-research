@@ -131,25 +131,40 @@ class _Budget:
         return min(run_left, day_left)
 
     def block_reason(self):
-        """なぜ使えないのかを1行で返す（日次上限と1実行上限を区別する）。"""
-        if self.daily is not None and self.daily.remaining(self.kind) <= 0:
+        """なぜ使えないのかを1行で返す（日次上限を優先して報告する）。"""
+        if self.hit_daily_limit or (
+                self.daily is not None and self.daily.remaining(self.kind) <= 0):
             return "日次上限({}回)に到達".format(self.daily.limits.get(self.kind))
         if self.used >= self.run_limit:
             return "1実行の上限({}回)に到達".format(self.run_limit)
         return self.blocked_by or "上限に到達"
 
     def spend(self, n=1):
+        """H4: 1実行上限と日次上限が**同時に**尽きても日次到達を必ず記録する。
+
+        先に run_limit で return していたため、最後の検索語で両方尽きたケースが
+        exit0 になり history.mark まで走っていた。副作用の無い判定を両方先に行う。
+        """
         n = int(n)
         if n <= 0:
             return True
-        if self.used + n > self.run_limit:
-            self.blocked_by = "1実行の上限({}回)".format(self.run_limit)
+        run_left = self.run_limit - self.used
+        day_left = self.daily.remaining(self.kind) if self.daily is not None else n
+        if day_left < n:
+            self.hit_daily_limit = True
+            self.blocked_by = "日次上限({}回)".format(
+                self.daily.limits.get(self.kind) if self.daily else "?")
+        if run_left < n:
             self.hit_run_limit = True
+            if not self.hit_daily_limit:
+                self.blocked_by = "1実行の上限({}回)".format(self.run_limit)
+            return False
+        if day_left < n:
             return False
         if self.daily is not None and not self.daily.spend(self.kind, n):
-            self.blocked_by = "日次上限({}回)".format(self.daily.limits.get(self.kind))
-            # 日次上限は「異常」扱い（部分結果で成功にしない・Codex#3）
+            # ロック下の最新値で弾かれた（別プロセスが消費した等）
             self.hit_daily_limit = True
+            self.blocked_by = "日次上限({}回)".format(self.daily.limits.get(self.kind))
             return False
         self.used += n
         return True
@@ -393,6 +408,11 @@ def run(argv=None, deps=None, base_dir=None):
     # ---- 3) メルカリ相場 + 4) 利益計算 ----
     comps_clients = {}
     adopted = []
+    # H2: 中断状態と連続失敗カウンタは実行全体で1つ（カテゴリ別にしない）。
+    mercari_state = ybr_mercari.MercariState()
+    mercari_adapter = deps.get("mercari_adapter")
+    if mercari_adapter is None:
+        mercari_adapter = ybr_mercari.MercapiAdapter()
     for cand in kept:
         cat = cand.get("category")
         profile = profiles_by_cat.get(cat) or ybr_profiles.load_union_profile(base_dir)
@@ -400,18 +420,14 @@ def run(argv=None, deps=None, base_dir=None):
         if client is None:
             client = ybr_mercari.MercariComps(
                 profile, cache,
-                adapter=deps.get("mercari_adapter"),
+                adapter=mercari_adapter,
                 budget=mercari_budget.spend,
                 throttle_fn=throttle_fn,
+                state=mercari_state,
             )
             comps_clients[cat] = client
-        if mercari_budget.remaining() <= 0:
-            cand["comps_status"] = "budget_exhausted"
-            cand["excluded_reason"] = "メルカリ照会の上限に到達（未照会・{}）".format(
-                mercari_budget.block_reason())
-            cand["excluded_kind"] = ybr_mercari.STATUS_KIND["budget_exhausted"]
-            excluded.append(cand)
-            continue
+        # 予算切れの事前判定はしない。キャッシュ命中は予算を消費しないので、
+        # MercariComps 側（キャッシュ確認 → 予算判定）に任せる（Codex r2 Medium）。
         client.fetch(cand)
         result = ybr_profit.evaluate(cand, profile)
         cand["profit"] = result
@@ -437,10 +453,10 @@ def run(argv=None, deps=None, base_dir=None):
     mercari_valid = sum(c.valid_comps for c in comps_clients.values())
     mercari_http_ok = sum(c.http_successes for c in comps_clients.values())
     mercari_cache_hits = sum(c.cache_hits for c in comps_clients.values())
-    mercari_aborted = any(c.aborted for c in comps_clients.values())
-    mercari_blocked = next(
-        (c.blocked_status for c in comps_clients.values() if c.blocked), None)
-    mercari_failures = sum(c.fetch_failures for c in comps_clients.values())
+    # 中断・失敗は共有 state が正（クライアントごとに数えない・H2）
+    mercari_aborted = mercari_state.aborted
+    mercari_blocked = mercari_state.blocked_status if mercari_state.blocked else None
+    mercari_failures = mercari_state.fetch_failures
     logger.log("mercari", requests=mercari_requests, valid_comps=mercari_valid,
                http_successes=mercari_http_ok, cache_hits=mercari_cache_hits,
                failures=mercari_failures, aborted=mercari_aborted,
@@ -452,9 +468,8 @@ def run(argv=None, deps=None, base_dir=None):
         mercari_degraded = "メルカリ相場の取得がブロックされ中断しました(HTTP {})".format(
             mercari_blocked)
     elif mercari_aborted:
-        last = next((c.last_error for c in comps_clients.values() if c.last_error), "")
         mercari_degraded = "メルカリ相場の取得が{}回連続で失敗し中断しました（{}）".format(
-            ybr_mercari.MAX_CONSECUTIVE_FAILURES, last or "原因不明")
+            ybr_mercari.MAX_CONSECUTIVE_FAILURES, mercari_state.last_error or "原因不明")
     if mercari_degraded is not None:
         if degraded is None:
             degraded = mercari_degraded
@@ -463,8 +478,8 @@ def run(argv=None, deps=None, base_dir=None):
             notes.append(mercari_degraded)
     elif degraded is None and kept and mercari_valid == 0 and mercari_failures > 0:
         # M7: キャッシュ命中は「有効相場」に数えるので、ここは本当に1件も無いときだけ
-        last = next((c.last_error for c in comps_clients.values() if c.last_error), "")
-        degraded = "メルカリ相場の取得が全て失敗しました（{}）".format(last or "原因不明")
+        degraded = "メルカリ相場の取得が全て失敗しました（{}）".format(
+            mercari_state.last_error or "原因不明")
     elif degraded is None and mercari_budget.hit_daily_limit:
         degraded = "メルカリの日次上限({}回)に到達し途中で打ち切りました（部分結果）".format(
             daily.limits.get("mercari"))
@@ -581,6 +596,16 @@ def selftest(argv=None, base_dir=None):
     except Exception as e:  # noqa: BLE001
         lines.append("mercapi: 未インストール（bin/ybr setup を実行）: {}".format(
             e.__class__.__name__))
+
+    # KR4: mercapi 内部の httpx クライアントに 403/429 検出フックを張れるか。
+    # 張れないと**ブロックを検知できず**取得を続けてしまうので、警告として必ず出す。
+    hook_ok, hook_detail = ybr_mercari.hook_support_status()
+    lines.append("mercapi ブロック検出フック: {} ({})".format(
+        "OK" if hook_ok else "NG", hook_detail))
+    if not hook_ok:
+        lines.append(
+            "  ⚠️ 403/429 を検知できません（mercapi/httpx の仕様変更の可能性）。"
+            "相場の結果を信用しないこと。")
 
     state_dir = args.state_dir or os.path.join(base_dir, "state")
     try:

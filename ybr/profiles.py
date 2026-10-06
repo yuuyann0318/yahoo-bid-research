@@ -62,24 +62,81 @@ _COMMON_DROP_TOKENS = [
 # 「春風コレクション」「Aタイプ」を誤除外しないため。
 _BRAND_SUFFIX_NG = ["風", "ふう", "タイプ", "調", "もどき", "style", "like"]
 
+# 検索語ファイルの日本語ブランド名に対応する英語表記（Codex r2 Medium）。
+# これが無いと「TIFFANY風」「GUCCIタイプ」「Cartier調」が素通りする。
+# profiles/*.json の brandAliases で編集できる（キー=検索語ファイル内の表記）。
+_BRAND_ALIASES = {
+    "ティファニー": ["tiffany", "tiffany&co", "tiffany & co"],
+    "カルティエ": ["cartier"],
+    "ブルガリ": ["bvlgari", "bulgari"],
+    "グッチ": ["gucci"],
+    "エルメス": ["hermes"],
+    "ジョージジェンセン": ["georg jensen", "georgjensen"],
+    "ミキモト": ["mikimoto"],
+    "4℃": ["yondoshi"],
+    "バーバリー": ["burberry", "burberrys"],
+    "モンクレール": ["moncler"],
+    "カナダグース": ["canada goose", "canadagoose"],
+    "ノースフェイス": ["the north face", "northface", "north face"],
+    "パタゴニア": ["patagonia"],
+    "アークテリクス": ["arcteryx", "arc'teryx"],
+    "シュプリーム": ["supreme"],
+    "ステューシー": ["stussy"],
+    "ラルフローレン": ["ralph lauren", "ralphlauren", "polo ralph"],
+    "トミーヒルフィガー": ["tommy hilfiger", "tommyhilfiger"],
+    "コムデギャルソン": ["comme des garcons", "commedesgarcons"],
+    "ヨウジヤマモト": ["yohji yamamoto", "yohjiyamamoto"],
+    "イッセイミヤケ": ["issey miyake", "isseymiyake"],
+    "メゾンマルジェラ": ["maison margiela", "margiela", "maison martin margiela"],
+    "ストーンアイランド": ["stone island", "stoneisland"],
+    "バブアー": ["barbour"],
+    "リーバイス": ["levis", "levi's", "levi strauss"],
+    "チャンピオン": ["champion"],
+    "カーハート": ["carhartt"],
+}
+
 # 品位+めっき表記（K18GP / 18KGP / SV925GP / 925GF ...）。照合側は NFKC+小文字化済み。
 # 末尾の (?![0-9a-z]) で "k18gps" のような誤爆を防ぐ（M5）。
+# 金属の品位表記（この後ろに GP/GF が来たら「めっき」と判断する）
+_KARAT = r"(?:k\s*\d{1,2}|\d{1,2}\s*k|sv\s*\d{3}|925|750|585|417|18k|14k|10k)"
+# GP / GF に区切り（空白・ハイフン・中黒）を挿し込んだ迂回表記（G-P / G F）。
+# 末尾の (?![0-9a-z]) で GPS / GFx を誤爆させない。
+_GP_SEP = r"g[\s\-・･]?p(?![0-9a-z])"
+_GF_SEP = r"g[\s\-・･]?f(?![0-9a-z])"
+
 _PLATING_PATTERNS = [
-    r"(k\d{1,2}|\d{1,2}k|sv\d{3}|925|750|585|417)\s*-?\s*(gp|gf)(?![0-9a-z])",
-    r"\d{1,2}\s*金\s*(gp|gf)(?![0-9a-z])",
+    # 品位表記の直後の GP/GF（区切り挿入も許す）
+    r"{}\s*-?\s*(?:{}|{})".format(_KARAT, _GP_SEP, _GF_SEP),
+    r"\d{{1,2}}\s*金\s*(?:{}|{})".format(_GP_SEP, _GF_SEP),
     r"gold\s*-?\s*(plated|filled)",
     r"(?<![0-9a-z])(gp|gf)\s*-?\s*(刻印|加工|仕上げ)",
+    # 単独語としての G-P / G・F（区切り必須。素の "gp" は ngWords 側で拾う）
+    r"(?<![0-9a-z])g[\s\-・･]p(?![0-9a-z])",
+    r"(?<![0-9a-z])g[\s\-・･]f(?![0-9a-z])",
 ]
 
-# NG出現は「救済フレーズに完全に含まれる」ときだけ救済する（M13）ので、
-# くっついた表記（K18GPではありません）を救うには正規表現の救済が必要になる。
+# --- 否定表現の救済（M13 の完全包含判定を前提にした正規表現） ---
+# 否定語そのもの
+_NEG = (r"(?:ありません|ございません|なし|無し|ない|無い|なく|無く|"
+        r"見当たりません|見られません)")
+# 二重否定・断定できない続き方は救済しない（Codex r2 Medium / 統括決定）。
+#   NG: 「GFじゃないわけではない」「虫食いはなくはない」
+_NO_DOUBLE = (r"(?!\s*(?:わけ|訳|こと|とも|とは|が|はない|は無い|はありません|"
+              r"はなく|は無く|もない|も無い))")
+_NEG_TAIL = _NEG + _NO_DOUBLE
+# 「〜ではありません」「〜じゃない」の前置き（品/商品 を許す・監査#2）
+_NEG_JOIN = r"\s*(?:品|商品)?\s*(?:では|じゃ|で は)\s*"
+
+# くっついた表記（K18GPではありません）は語リストでは救えないのでパターンで救う。
 _PLATING_NEGATION_PATTERNS = [
-    r"(?:k\d{1,2}|\d{1,2}k|sv\d{3}|925|750|585|417)?\s*-?\s*"
-    r"(?:gp|gf)\s*(?:品|刻印)?\s*(?:では|じゃ)\s*(?:ありません|ない|なく|無い|無く)",
-    r"(?:金|銀)?\s*(?:メッキ|めっき)\s*(?:品|加工)?\s*(?:では|じゃ)\s*"
-    r"(?:ありません|ない|なく|無い|無く)",
-    r"(?:コピー|レプリカ|偽物|模造)\s*(?:品)?\s*(?:では|じゃ)\s*"
-    r"(?:ありません|ない|なく|無い|無く)",
+    r"(?:{})?\s*-?\s*(?:gp|gf|{}|{})\s*(?:品|商品|刻印)?\s*(?:では|じゃ)\s*{}".format(
+        _KARAT, _GP_SEP, _GF_SEP, _NEG_TAIL),
+    r"(?:金|銀)?\s*(?:メッキ|めっき)" + _NEG_JOIN + _NEG_TAIL,
+]
+# 模倣表現の否定。長いNG語（スーパーコピー）ごと覆えるよう接頭辞も含める（監査#2）。
+_FAKE_NEGATION_PATTERNS = [
+    r"(?:スーパー|ハイ|精巧な|精巧)?(?:コピー|レプリカ|偽物|模造|イミテーション)"
+    + _NEG_JOIN + _NEG_TAIL,
 ]
 
 ACCESSORY_DEFAULTS = {
@@ -100,17 +157,16 @@ ACCESSORY_DEFAULTS = {
         "訳あり", "難あり",
     ],
     "brandSuffixNgWords": list(_BRAND_SUFFIX_NG),
+    "brandAliases": dict(_BRAND_ALIASES),
     # 正規表現での除外（GP/GF の刻印表記ゆれ）
     "ngPatterns": list(_PLATING_PATTERNS),
     # 正規表現での救済（否定表現。完全包含判定のため語リストでは救えない）
-    "allowPatterns": list(_PLATING_NEGATION_PATTERNS),
+    "allowPatterns": list(_PLATING_NEGATION_PATTERNS) + list(_FAKE_NEGATION_PATTERNS),
     # NG語を打ち消す否定・正規表現（これに重なる出現は除外扱いにしない）
+    # 否定表現（「GPではありません」等）は **allowPatterns 側だけ** で扱う。
+    # ここに平文で置くと二重否定（「GPではないわけではない」）まで救済してしまう。
     "allowPhrases": [
-        "GPではありません", "GPではない", "GPではなく", "GP品ではありません",
-        "メッキではありません", "メッキではない", "めっきではありません",
-        "メッキ品ではありません", "コピーではありません", "レプリカではありません",
-        "偽物ではありません", "ロジウムコーティング", "ロジウムメッキ",
-        "まとめて購入", "まとめてお取引",
+        "ロジウムコーティング", "ロジウムメッキ", "まとめて購入", "まとめてお取引",
     ],
     "noiseWords": list(_COMMON_NOISE) + ["レディース", "メンズ", "ユニセックス"],
     # 相場クエリから落とすトークン（正規化後のトークン全体に対する正規表現）
@@ -130,21 +186,23 @@ APPAREL_DEFAULTS = {
         "ダメージ", "まとめ売り", "まとめて", "セット売り", "部品取り", "ノーブランド",
         "リメイク", "虫食い", "虫喰い", "シミあり", "シミ有", "シミ多", "染み",
     ],
+    # 「ダメージ少」等は ngWords「ダメージ」に先に当たるため到達不能（監査#3）。
+    # ダメージ系の扱いは README の「NG語の扱いで知っておくこと」に記載。
     "cautionWords": [
         "色あせ", "色褪せ", "毛玉", "ほつれ", "擦れ", "スレ",
         "日焼け", "リペア", "補修", "アウトレット", "サイズ不明",
-        "ダメージ少", "ダメージ少なめ",  # 損傷の肯定表現は救済せず注意に出す（M12）
     ],
     "brandSuffixNgWords": list(_BRAND_SUFFIX_NG),
+    "brandAliases": dict(_BRAND_ALIASES),
     "ngPatterns": [],
-    "allowPatterns": [
-        r"(?:ダメージ|汚れ|破れ|シミ|染み|虫食い)\s*(?:は)?\s*"
-        r"(?:ありません|ない|なく|無い|無く|見当たりません)",
+    "allowPatterns": list(_FAKE_NEGATION_PATTERNS) + [
+        r"(?:ダメージ|汚れ|破れ|穴|シミ|染み|虫食い|虫喰い|難|訳)"
+        r"\s*(?:は|も)?\s*" + _NEG_TAIL,
     ],
+    # 否定表現（「ダメージなし」「汚れありません」等）は allowPatterns 側だけで扱う。
     "allowPhrases": [
         "ダメージ加工", "ヴィンテージ加工", "ビンテージ加工", "加工ダメージ",
-        "ダメージなし", "ダメージ無し", "ユーズド加工",
-        "汚れありません", "破れありません", "まとめて購入", "まとめてお取引",
+        "ユーズド加工", "まとめて購入", "まとめてお取引",
         # 完全包含だけを救済する実装（M13）なので「スーパーコピーライト」は救済されない
         "コピーライト",
     ],
@@ -218,8 +276,9 @@ def load_profile(category, base_dir=None, overrides=None):
     merged.update(overrides or {})
     profile = build_profile(category, merged)
     if not profile.get("brandTerms"):
-        # 「<ブランド名|ライン名>風」判定用の語。検索語ファイルから自動で作る（M23）。
-        profile["brandTerms"] = brand_terms(category, base_dir=base_dir)
+        # 「<ブランド名|ライン名>風」判定用の語。検索語ファイル + 英語別名から作る（M23）。
+        profile["brandTerms"] = brand_terms(
+            category, base_dir=base_dir, aliases=profile.get("brandAliases"))
     return profile
 
 
@@ -283,13 +342,24 @@ def _token_set(category, base_dir=None):
     return tokens
 
 
-def brand_terms(category, base_dir=None):
-    """「<ブランド名|ライン名>風」判定に使う語。検索語ファイルのトークンから作る。
+def brand_terms(category, base_dir=None, aliases=None):
+    """「<ブランド名|ライン名>風」判定に使う語。
 
+    検索語ファイルのトークン + 対応する英語表記（brandAliases）。
+    英綴りを入れないと「TIFFANY風」「GUCCIタイプ」が素通りする（Codex r2）。
     生成語（ダウン・ジャケット等）も入るが、それらに「風」が付く出品
     （フェイクダウン等）も仕入れ対象外なので残して良い。
     """
-    return sorted(_token_set(category, base_dir=base_dir))
+    tokens = _token_set(category, base_dir=base_dir)
+    table = _BRAND_ALIASES if aliases is None else aliases
+    for brand, alias_list in (table or {}).items():
+        key = _norm(brand)
+        if key in tokens or any(key in t for t in tokens):
+            for alias in alias_list or ():
+                a = _norm(alias)
+                if len(a) >= 3:
+                    tokens.add(a)
+    return sorted(tokens)
 
 
 # ngWords / allowPhrases 等を両カテゴリの和集合にするキー（M11）

@@ -73,6 +73,41 @@ class TestDailyBudget(unittest.TestCase):
             finally:
                 os.chmod(d, 0o700)
 
+    def test_save_failure_still_enforces_limit(self):
+        """H3: 保存に失敗しても同一実行内の消費を忘れない（上限1なら1回だけ通す）。"""
+        with tempfile.TemporaryDirectory() as d:
+            b = self._budget(d, {"yahoo": 1})
+            os.chmod(d, 0o500)
+            try:
+                self.assertTrue(b.spend("yahoo", 1))
+                self.assertFalse(b.spend("yahoo", 1), "保存失敗後に上限を超えて消費できる")
+                self.assertFalse(b.spend("yahoo", 1))
+                self.assertEqual(b.remaining("yahoo"), 0)
+                self.assertEqual(b.used("yahoo"), 1)
+            finally:
+                os.chmod(d, 0o700)
+
+    def test_save_failure_limit3_allows_exactly_three(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = self._budget(d, {"yahoo": 3})
+            os.chmod(d, 0o500)
+            try:
+                ok = [b.spend("yahoo", 1) for _ in range(5)]
+                self.assertEqual(ok, [True, True, True, False, False], ok)
+            finally:
+                os.chmod(d, 0o700)
+
+    def test_unsaved_is_cleared_once_save_succeeds(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = self._budget(d, {"yahoo": 5})
+            os.chmod(d, 0o500)
+            try:
+                b.spend("yahoo", 1)
+            finally:
+                os.chmod(d, 0o700)
+            self.assertTrue(b.spend("yahoo", 1))
+            self.assertEqual(b.used("yahoo"), 2)  # 未保存1 + 今回1 を二重計上しない
+
     def test_lock_file_is_created_next_to_state(self):
         with tempfile.TemporaryDirectory() as d:
             b = self._budget(d)

@@ -1,5 +1,5 @@
 {
-  "_note": "本人未承認の初期値。送料・NG語・しきい値は運用で調整する。このファイルの値が ybr/profiles.py の既定値を上書きする。brandTerms（<ブランド名>風 の判定語）は keywords/<category>.txt から自動生成する。",
+  "_note": "本人未承認の初期値。送料・NG語・しきい値は運用で調整する。このファイルの値が ybr/profiles.py の既定値を上書きする。否定表現の救済は allowPatterns（二重否定を弾く）側だけで行う。brandTerms（<ブランド名>風 の判定語）は keywords/<category>.txt と brandAliases から自動生成する。",
   "label": "アパレル",
   "sellShippingYen": 850,
   "mercariFeeRate": 0.1,
@@ -53,6 +53,109 @@
     "style",
     "like"
   ],
+  "brandAliases": {
+    "ティファニー": [
+      "tiffany",
+      "tiffany&co",
+      "tiffany & co"
+    ],
+    "カルティエ": [
+      "cartier"
+    ],
+    "ブルガリ": [
+      "bvlgari",
+      "bulgari"
+    ],
+    "グッチ": [
+      "gucci"
+    ],
+    "エルメス": [
+      "hermes"
+    ],
+    "ジョージジェンセン": [
+      "georg jensen",
+      "georgjensen"
+    ],
+    "ミキモト": [
+      "mikimoto"
+    ],
+    "4℃": [
+      "yondoshi"
+    ],
+    "バーバリー": [
+      "burberry",
+      "burberrys"
+    ],
+    "モンクレール": [
+      "moncler"
+    ],
+    "カナダグース": [
+      "canada goose",
+      "canadagoose"
+    ],
+    "ノースフェイス": [
+      "the north face",
+      "northface",
+      "north face"
+    ],
+    "パタゴニア": [
+      "patagonia"
+    ],
+    "アークテリクス": [
+      "arcteryx",
+      "arc'teryx"
+    ],
+    "シュプリーム": [
+      "supreme"
+    ],
+    "ステューシー": [
+      "stussy"
+    ],
+    "ラルフローレン": [
+      "ralph lauren",
+      "ralphlauren",
+      "polo ralph"
+    ],
+    "トミーヒルフィガー": [
+      "tommy hilfiger",
+      "tommyhilfiger"
+    ],
+    "コムデギャルソン": [
+      "comme des garcons",
+      "commedesgarcons"
+    ],
+    "ヨウジヤマモト": [
+      "yohji yamamoto",
+      "yohjiyamamoto"
+    ],
+    "イッセイミヤケ": [
+      "issey miyake",
+      "isseymiyake"
+    ],
+    "メゾンマルジェラ": [
+      "maison margiela",
+      "margiela",
+      "maison martin margiela"
+    ],
+    "ストーンアイランド": [
+      "stone island",
+      "stoneisland"
+    ],
+    "バブアー": [
+      "barbour"
+    ],
+    "リーバイス": [
+      "levis",
+      "levi's",
+      "levi strauss"
+    ],
+    "チャンピオン": [
+      "champion"
+    ],
+    "カーハート": [
+      "carhartt"
+    ]
+  },
   "cautionWords": [
     "色あせ",
     "色褪せ",
@@ -64,26 +167,21 @@
     "リペア",
     "補修",
     "アウトレット",
-    "サイズ不明",
-    "ダメージ少",
-    "ダメージ少なめ"
+    "サイズ不明"
   ],
   "allowPhrases": [
     "ダメージ加工",
     "ヴィンテージ加工",
     "ビンテージ加工",
     "加工ダメージ",
-    "ダメージなし",
-    "ダメージ無し",
     "ユーズド加工",
-    "汚れありません",
-    "破れありません",
     "まとめて購入",
     "まとめてお取引",
     "コピーライト"
   ],
   "allowPatterns": [
-    "(?:ダメージ|汚れ|破れ|シミ|染み|虫食い)\\s*(?:は)?\\s*(?:ありません|ない|なく|無い|無く|見当たりません)"
+    "(?:スーパー|ハイ|精巧な|精巧)?(?:コピー|レプリカ|偽物|模造|イミテーション)\\s*(?:品|商品)?\\s*(?:では|じゃ|で は)\\s*(?:ありません|ございません|なし|無し|ない|無い|なく|無く|見当たりません|見られません)(?!\\s*(?:わけ|訳|こと|とも|とは|が|はない|は無い|はありません|はなく|は無く|もない|も無い))",
+    "(?:ダメージ|汚れ|破れ|穴|シミ|染み|虫食い|虫喰い|難|訳)\\s*(?:は|も)?\\s*(?:ありません|ございません|なし|無し|ない|無い|なく|無く|見当たりません|見られません)(?!\\s*(?:わけ|訳|こと|とも|とは|が|はない|は無い|はありません|はなく|は無く|もない|も無い))"
   ],
   "noiseWords": [
     "美品",

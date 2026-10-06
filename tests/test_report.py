@@ -172,6 +172,61 @@ class TestUrlStripping(unittest.TestCase):
     def test_normal_title_is_kept(self):
         self.assertEqual(report.safe_title("ティファニー ネックレス"), "ティファニー ネックレス")
 
+    def test_url_directly_after_japanese_is_stripped(self):
+        """Codex r2: `\\b` は Unicode 単語境界なので「正規品HTTPS://」を取り落としていた。"""
+        self.assertNotIn("evil", report.safe_title("正規品HTTPS://evil.invalid/fake").lower())
+        self.assertNotIn("evil", report.safe_title("美品https://evil.invalid/x").lower())
+
+    def test_bracket_remnants_are_removed(self):
+        """監査#5: <HTTPS://…> の山括弧片を残さない。"""
+        out = report.safe_title("カナダグース <HTTPS://evil.invalid/fake>")
+        self.assertNotIn("<", out)
+        self.assertNotIn(">", out)
+        self.assertNotIn("evil", out.lower())
+        self.assertIn("カナダグース", out)
+
+    def test_fullwidth_brackets_removed(self):
+        out = report.safe_title("商品 ＜https://evil.invalid/x＞")
+        self.assertNotIn("＜", out)
+        self.assertNotIn("＞", out)
+
+    def test_md_has_no_leftover_brackets_from_fake_url(self):
+        bad = _adopted(title="カナダグース <HTTPS://evil.invalid/fake>")
+        md = report.render_markdown(_payload(adopted=[bad]))
+        self.assertNotIn("evil.invalid", md)
+
+
+class TestDivergenceWarning(unittest.TestCase):
+    """監査提案: n が少ないのに予想売値が現在総額から離れすぎている＝別物クエリ疑い。"""
+
+    def _cand(self, count, expected, total):
+        c = _adopted()
+        c["comps"]["count"] = count
+        c["profit"]["comps_count"] = count
+        c["profit"]["expected_sale"] = expected
+        c["price"] = total
+        c["total_cost"] = total
+        return c
+
+    def test_warns_when_small_n_and_big_gap(self):
+        md = report.render_markdown(_payload(adopted=[self._cand(5, 46800, 13000)]))
+        self.assertIn("乖離大・別物クエリ疑い", md)
+        self.assertIn("3.6倍", md)
+
+    def test_no_warning_when_n_is_large(self):
+        md = report.render_markdown(_payload(adopted=[self._cand(110, 78000, 20000)]))
+        self.assertNotIn("乖離大", md)
+
+    def test_no_warning_when_gap_is_small(self):
+        md = report.render_markdown(_payload(adopted=[self._cand(5, 20000, 10000)]))
+        self.assertNotIn("乖離大", md)
+
+    def test_candidate_is_still_adopted(self):
+        payload = _payload(adopted=[self._cand(5, 46800, 13000)])
+        md = report.render_markdown(payload)
+        self.assertIn("## 一覧", md)
+        self.assertEqual(len(payload["adopted"]), 1)
+
 
 class TestCsvInjection(unittest.TestCase):
     """m20 / Codex#13: CSVの数式インジェクションを無害化する。"""

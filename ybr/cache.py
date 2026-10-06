@@ -193,6 +193,9 @@ class DailyBudget:
         self.limits.update(limits or {})
         self.warnings = []
         self.save_failed = False
+        # H3: 保存に失敗した消費はディスクに残らない。同一実行内で消えないよう
+        # メモリに保持し、used()/spend() で必ず合算する（上限1なら1回しか通らない）。
+        self._unsaved = {}
         parent = os.path.dirname(path)
         if parent:
             try:
@@ -243,21 +246,29 @@ class DailyBudget:
                         pass
 
     def used(self, kind):
+        """ディスク上の消費 + **保存できなかった消費**（H3）。"""
         with self._locked():
-            return int((self._read_state().get("counts") or {}).get(kind, 0))
+            on_disk = int((self._read_state().get("counts") or {}).get(kind, 0))
+        return on_disk + int(self._unsaved.get(kind, 0))
 
     def remaining(self, kind):
         return max(0, int(self.limits.get(kind, 0)) - self.used(kind))
 
     def spend(self, kind, n=1):
-        """ロック下で 読み→判定→更新 を一体で行う（m21）。"""
+        """ロック下で 読み→判定→更新 を一体で行う（m21）。
+
+        保存に失敗しても**消費を忘れない**（H3）。忘れると同一実行内で日次上限を
+        いくらでも超えられる（上限1で3回成功していた）。
+        """
         n = int(n)
         if n <= 0:
             return True
+        unsaved = int(self._unsaved.get(kind, 0))
         with self._locked():
             state = self._read_state()
             counts = state.setdefault("counts", {})
-            used = int(counts.get(kind, 0))
+            on_disk = int(counts.get(kind, 0))
+            used = on_disk + unsaved
             limit = int(self.limits.get(kind, 0))
             if used + n > limit:
                 return False
@@ -266,8 +277,14 @@ class DailyBudget:
                 _save_json_atomic(self.path, state)
             except OSError as e:
                 self.save_failed = True
+                self._unsaved[kind] = unsaved + n
                 self._warn(
-                    "日次予算の保存に失敗（次回起動で予算が巻き戻る恐れ）: {}".format(e))
+                    "日次予算の保存に失敗（この実行の消費はメモリで数える / "
+                    "次回起動で予算が巻き戻る恐れ）: {}".format(e))
+            else:
+                # 保存できたので未保存分はディスクに取り込まれた
+                if unsaved:
+                    self._unsaved[kind] = 0
             return True
 
 

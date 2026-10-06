@@ -147,6 +147,17 @@ class TestSearchKeyword(unittest.TestCase):
             yahoo.search_keyword("テスト", fetcher=boom)
 
 
+def _only_first_spend():
+    """1回目だけ予算を認める spend（リトライを1回に絞るため）。"""
+    state = {"n": 0}
+
+    def spend(n=1):
+        state["n"] += int(n)
+        return state["n"] <= 1
+
+    return spend
+
+
 class TestBlockedOnLaterPages(unittest.TestCase):
     """C2: 2ページ目以降の 403/429 を握り潰すと403連打になる。必ず再送出する。"""
 
@@ -271,6 +282,44 @@ class TestFailureTracker(unittest.TestCase):
             except OSError:
                 pass
         self.assertLess(t.consecutive, 3)
+
+    def test_failure_counted_once_per_http_attempt(self):
+        """Codex r2: default_fetcher と search_keyword の二重計上をしない。
+
+        リトライが予算で1回に絞られた状態でも、実HTTP1回=失敗1回で数える。
+        """
+        t = yahoo.FailureTracker(limit=3)
+        opened = []
+
+        def fake_urlopen(*_a, **_kw):
+            opened.append(1)
+            raise OSError("down")
+
+        original = yahoo.urllib.request.urlopen
+        original_throttle = yahoo.throttle
+        yahoo.urllib.request.urlopen = fake_urlopen
+        yahoo.throttle = lambda _s=None: None  # 実スリープを避ける
+        try:
+            # spend が1回しか通らない → リトライなし（実HTTP 1回）
+            with self.assertRaises(OSError):
+                yahoo.search_keyword("語1", fetcher=None, spend=_only_first_spend(),
+                                     tracker=t, now=NOW)
+        finally:
+            yahoo.urllib.request.urlopen = original
+            yahoo.throttle = original_throttle
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(t.total, 1, "実HTTP1回なのに失敗が二重計上されている")
+        self.assertEqual(t.consecutive, 1)
+
+    def test_injected_fetcher_failure_counted_once(self):
+        t = yahoo.FailureTracker(limit=3)
+
+        def boom(_url):
+            raise OSError("x")
+
+        with self.assertRaises(OSError):
+            yahoo.search_keyword("語1", fetcher=boom, tracker=t)
+        self.assertEqual(t.total, 1)
 
     def test_default_fetcher_raises_consecutive_failure(self):
         t = yahoo.FailureTracker(limit=3)
