@@ -9,6 +9,8 @@
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -174,47 +176,99 @@ class CompsCache:
 
 # --- 日次リクエスト予算 -------------------------------------------------------
 class DailyBudget:
-    """state/daily-budget.json。spend(kind, n) は上限内なら消費して True。"""
+    """state/daily-budget.json。spend(kind, n) は上限内なら消費して True。
+
+    m21: 読み→判定→更新を **fcntl.flock（排他）下で一体化**する。起動時スナップショットで
+    判定すると、同時実行した2プロセスが残り1回を両方消費できてしまう。
+    保存に失敗したときは**停止せず警告を残して続行**する（監査判断。ただし
+    warnings に出して result.md / meta から見えるようにする）。
+    """
 
     DEFAULT_LIMITS = {"yahoo": 120, "mercari": 360}
+    LOCK_SUFFIX = ".lock"
 
     def __init__(self, path, limits=None):
         self.path = path
         self.limits = dict(self.DEFAULT_LIMITS)
         self.limits.update(limits or {})
-        data = _load_json_safe(path, {"date": None, "counts": {}})
+        self.warnings = []
+        self.save_failed = False
+        parent = os.path.dirname(path)
+        if parent:
+            try:
+                os.makedirs(parent, exist_ok=True)
+            except OSError as e:
+                self._warn("予算ファイルのディレクトリを作れません: {}".format(e))
+
+    def _warn(self, message):
+        if message not in self.warnings:
+            self.warnings.append(message)
+
+    def _read_state(self):
+        data = _load_json_safe(self.path, {"date": None, "counts": {}})
         if not isinstance(data, dict):
             data = {"date": None, "counts": {}}
         if not isinstance(data.get("counts"), dict):
             data["counts"] = {}
-        self._state = data
+        if data.get("date") != today_str():
+            data = {"date": today_str(), "counts": {}}
+        return data
 
-    def _ensure_today(self):
-        today = today_str()
-        if self._state.get("date") != today:
-            self._state = {"date": today, "counts": {}}
+    @contextlib.contextmanager
+    def _locked(self):
+        """予算ファイル専用ロック。取れなければ警告して続行（止めない）。"""
+        lock_path = self.path + self.LOCK_SUFFIX
+        fd = None
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError as e:
+            self._warn("予算ファイルのロックを取得できません（同時実行の二重消費の恐れ）: {}".format(e))
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                fd = None
+        try:
+            yield
+        finally:
+            if fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
 
     def used(self, kind):
-        self._ensure_today()
-        return int((self._state.get("counts") or {}).get(kind, 0))
+        with self._locked():
+            return int((self._read_state().get("counts") or {}).get(kind, 0))
 
     def remaining(self, kind):
         return max(0, int(self.limits.get(kind, 0)) - self.used(kind))
 
     def spend(self, kind, n=1):
-        self._ensure_today()
+        """ロック下で 読み→判定→更新 を一体で行う（m21）。"""
         n = int(n)
         if n <= 0:
             return True
-        if self.remaining(kind) < n:
-            return False
-        counts = self._state.setdefault("counts", {})
-        counts[kind] = int(counts.get(kind, 0)) + n
-        try:
-            _save_json_atomic(self.path, self._state)
-        except OSError:
-            pass  # 書けなくても会計はプロセス内で続ける
-        return True
+        with self._locked():
+            state = self._read_state()
+            counts = state.setdefault("counts", {})
+            used = int(counts.get(kind, 0))
+            limit = int(self.limits.get(kind, 0))
+            if used + n > limit:
+                return False
+            counts[kind] = used + n
+            try:
+                _save_json_atomic(self.path, state)
+            except OSError as e:
+                self.save_failed = True
+                self._warn(
+                    "日次予算の保存に失敗（次回起動で予算が巻き戻る恐れ）: {}".format(e))
+            return True
 
 
 # --- 重複履歴 -----------------------------------------------------------------

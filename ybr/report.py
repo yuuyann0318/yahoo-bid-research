@@ -19,7 +19,10 @@ import re
 from datetime import datetime
 
 _CTRL_RE = re.compile("[\\x00-\\x1f\\x7f\\u2028\\u2029]")
-_URL_IN_TEXT_RE = re.compile(r"https?://\S+")
+# 大文字スキーム（HTTPS://）でも除去する（m20 / Codex#14）
+_URL_IN_TEXT_RE = re.compile(r"(?i)\b(?:https?|ftp)://\S+")
+# CSV の数式インジェクション対策（m20 / Codex#13）。先頭がこれらの文字なら無害化する。
+_CSV_FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
 
 # メルカリ検索は完全一致ではなく関連度順のため、件数が多いときは
 # 「別物まで混ざった相場」になりうる。その場合は注意として明示する（実走で確認）。
@@ -33,7 +36,7 @@ LOG_NAME = "run.log"
 CSV_HEADER = [
     "順位", "カテゴリ", "商品名", "オークションID", "ヤフオクURL",
     "現在価格", "仕入送料", "総額", "入札件数", "終了日時", "残り分",
-    "メルカリ予想売値", "相場件数", "確度", "相場クエリ",
+    "メルカリ予想売値", "相場件数", "相場元件数", "確度", "相場クエリ",
     "入札提案価格", "提案額での見込み利益", "損益分岐入札額",
     "メルカリ売切相場URL", "検索語", "注意", "備考",
 ]
@@ -71,6 +74,30 @@ def truncate_title(title, limit=44):
 def _cell(text):
     """表セル用: 1行化＋`|` のエスケープ。"""
     return sanitize_text(text).replace("|", "／")
+
+
+def csv_safe(value):
+    """CSVセルの数式インジェクション対策（m20）。数値はそのまま、文字列だけ無害化する。"""
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
+    text = sanitize_text(value)
+    if text[:1] in _CSV_FORMULA_LEAD:
+        return "'" + text
+    return text
+
+
+def comps_count_label(candidate):
+    """「110（元115・外れ値除外）」の形。IQRトリムを隠さない（m18）。"""
+    comps = (candidate or {}).get("comps") or {}
+    count = comps.get("count")
+    if count is None:
+        return "不明"
+    trimmed_from = comps.get("trimmed_from")
+    if trimmed_from and int(trimmed_from) > int(count):
+        return "{}（元{}・外れ値除外）".format(int(count), int(trimmed_from))
+    return str(int(count))
 
 
 def _yen(value):
@@ -145,8 +172,8 @@ def _comps_cell(candidate):
     profit = candidate.get("profit") or {}
     if not profit.get("expected_sale"):
         return "相場不明"
-    return "{}({}件・確度{})".format(
-        _yen(profit["expected_sale"]), profit.get("comps_count", 0),
+    return "{}(n={}・確度{})".format(
+        _yen(profit["expected_sale"]), comps_count_label(candidate),
         profit.get("confidence") or "?")
 
 
@@ -179,12 +206,16 @@ def _detail_block(rank, c):
     lines.append("- 終了: {}（{}）".format(_end_label(c), _remaining_label(c)))
     if comps.get("count"):
         lines.append(
-            "- メルカリ売切相場（目安）: 中央値 {} / {}件 / p25 {} 〜 p75 {} / クエリ「{}」".format(
-                _yen(comps.get("median")), comps.get("count"),
+            "- メルカリ売切相場（目安）: 中央値 {} / n={} / p25 {} 〜 p75 {} / クエリ「{}」".format(
+                _yen(comps.get("median")), comps_count_label(c),
                 _yen(comps.get("p25")), _yen(comps.get("p75")),
                 sanitize_text(comps.get("query"))))
     else:
-        lines.append("- メルカリ売切相場: 取得できず（相場不明）")
+        status = sanitize_text(c.get("comps_status") or "")
+        detail = sanitize_text(c.get("comps_error") or "")
+        label = "相場不明(売切0件)" if status == "zero_hits" else "未照会"
+        lines.append("- メルカリ売切相場: 取得できず（{}{}）".format(
+            label, "・" + detail if detail else ""))
     lines.append("- 予想売値（目安）: {}（確度 {}）".format(
         _yen(profit.get("expected_sale")), profit.get("confidence") or "?"))
     lines.append(
@@ -231,15 +262,33 @@ def render_markdown(payload):
     lines.append("- 生成: {}".format(sanitize_text(meta.get("generated_at"))))
     lines.append("- 対象カテゴリ: {}".format(
         sanitize_text(" / ".join(meta.get("categories") or []))))
-    lines.append("- 目標利益率: {:.0f}%（対売上・目安）".format(float(meta.get("margin_pct") or 0)))
-    lines.append("- 検索語 {}語 / ヤフオク取得 {}件 / 一次フィルタ通過 {}件 / メルカリ照会 {}回".format(
-        len(meta.get("keywords") or []), meta.get("yahoo_items", 0),
+    # 実効利益率を見出しのすぐ下に出す（m17。指定値と違うときは併記して黙って変えない）
+    effective = float(meta.get("margin_pct") or 0)
+    requested = meta.get("margin_pct_requested")
+    if requested is not None and abs(float(requested) - effective) > 1e-9:
+        lines.append(
+            "- 目標利益率: **{:.0f}%**（対売上・目安）← 指定の{:.0f}%は使用不可のため変更".format(
+                effective, float(requested)))
+    else:
+        lines.append("- 目標利益率: {:.0f}%（対売上・目安）".format(effective))
+    # 計画語数と実行語数を分けて出す（m19。実走4語でも23語と見せてはいけない）
+    lines.append("- 検索語 予定{}語／実行{}語 / ヤフオク取得 {}件 / 一次フィルタ通過 {}件 / メルカリ照会 {}回".format(
+        meta.get("keywords_planned", len(meta.get("keywords") or [])),
+        meta.get("keywords_executed", 0), meta.get("yahoo_items", 0),
         meta.get("prefilter_kept", 0), meta.get("mercari_requests", 0)))
     lines.append("- 採用 {}件 / 所要 {:.1f}秒 / 終了コード {}".format(
         len(adopted), float(meta.get("elapsed_sec") or 0.0), meta.get("exit_code", 0)))
+    if meta.get("yahoo_failures"):
+        lines.append("- ⚠️ ヤフオク取得に失敗した検索語: {}語（{}）".format(
+            meta["yahoo_failures"], sanitize_text(meta.get("yahoo_last_error") or "原因不明")))
     lines.append("- 金額はすべて**目安**（メルカリ売切相場の中央値からの逆算）。実際の落札・販売を保証しない。")
     lines.append("- このツールは入札しない（リストアップまで）。入札判断と実行は人が行う。")
     lines.append("")
+
+    for warning in meta.get("warnings") or []:
+        lines.append("- ⚠️ {}".format(sanitize_text(warning)))
+    if meta.get("warnings"):
+        lines.append("")
 
     for note in meta.get("notes") or []:
         lines.append("- メモ: {}".format(sanitize_text(note)))
@@ -276,12 +325,12 @@ def render_csv(payload):
     for i, c in enumerate(payload.get("adopted") or [], start=1):
         profit = c.get("profit") or {}
         comps = c.get("comps") or {}
-        writer.writerow([
+        writer.writerow([csv_safe(v) for v in (
             i,
-            sanitize_text(c.get("category")),
+            c.get("category"),
             safe_title(c.get("title")),
-            sanitize_text(c.get("auction_id")),
-            sanitize_text(c.get("url")),
+            c.get("auction_id"),
+            c.get("url"),
             c.get("price"),
             "未定" if c.get("postage") is None else c.get("postage"),
             c.get("total_cost"),
@@ -289,17 +338,18 @@ def render_csv(payload):
             _end_label(c),
             c.get("minutes_remaining"),
             profit.get("expected_sale"),
-            profit.get("comps_count"),
+            comps_count_label(c),
+            comps.get("trimmed_from") or comps.get("count"),
             profit.get("confidence"),
-            sanitize_text(comps.get("query")),
+            comps.get("query"),
             profit.get("suggested_bid"),
             profit.get("profit_at_bid"),
             profit.get("break_even_bid"),
-            sanitize_text(c.get("mercari_url")),
-            sanitize_text(c.get("keyword")),
-            sanitize_text(" / ".join(_notes(c))),
+            c.get("mercari_url"),
+            c.get("keyword"),
+            " / ".join(_notes(c)),
             CSV_DISCLAIMER,
-        ])
+        )])
     return buf.getvalue()
 
 

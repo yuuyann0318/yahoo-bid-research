@@ -272,6 +272,235 @@ class TestFetch(unittest.TestCase):
         self.assertEqual(len(ad.calls), 1)
 
 
+class _DictCache:
+    def __init__(self):
+        self.store = {}
+
+    def get(self, q):
+        return self.store.get(q)
+
+    def put(self, q, stats):
+        self.store[q] = dict(stats)
+
+
+class TestCacheDoesNotCarryFallbackLevel(unittest.TestCase):
+    """C1: キャッシュは統計だけを持つ。縮退段数と係数は取得時に毎回決める。"""
+
+    def setUp(self):
+        self.p = build_profile("accessory", {})
+
+    def test_cached_entry_has_no_fallback_level(self):
+        cache = _DictCache()
+        ad = _Adapter({"ティファニー オープンハート": [50000, 50000, 50000]})
+        cand = {"title": "ティファニー オープンハート", "keyword": "ティファニー"}
+        _mc, comps = _comps(self.p, cand, ad, cache=cache)
+        self.assertEqual(comps["fallback_level"], 0)
+        stored = cache.store["ティファニー オープンハート"]
+        self.assertNotIn("fallback_level", stored)
+        self.assertNotIn("cache_hit", stored)
+        self.assertNotIn("query", stored)
+
+    def test_level0_cache_reused_at_level2_keeps_level2(self):
+        """0段で入れたキャッシュを別商品の2段縮退で引いても level2 のまま。"""
+        cache = _DictCache()
+        ad = _Adapter({"ティファニー オープンハート": [50000, 50000, 50000, 50000]})
+        first = {"title": "ティファニー オープンハート", "keyword": "ティファニー"}
+        _m1, c1 = _comps(self.p, first, ad, cache=cache)
+        self.assertEqual(c1["fallback_level"], 0)
+
+        # 6語→3語→2語 と縮退して同じ2語クエリに到達する候補
+        long_title = "ティファニー オープンハート ネックレス シルバー スモール ペンダント"
+        second = {"title": long_title, "keyword": "ティファニー"}
+        mc2, c2 = _comps(self.p, second, ad, cache=cache)
+        self.assertEqual(c2["query"], "ティファニー オープンハート")
+        self.assertEqual(c2["fallback_level"], 2, "縮退段数がキャッシュで汚染されている")
+        self.assertTrue(c2["cache_hit"])
+        self.assertEqual(mc2.requests_made, 2)  # 6語・3語はHTTP、2語はキャッシュ
+
+    def test_coefficient_applies_after_cache_hit(self):
+        """C1 の実害確認: 係数0.90が外れて予想売値が+11%になっていた。"""
+        from ybr import profit as ybr_profit
+        cache = _DictCache()
+        ad = _Adapter({"ティファニー オープンハート": [50000] * 10})
+        _m1, _c1 = _comps(self.p, {"title": "ティファニー オープンハート",
+                                   "keyword": "ティファニー"}, ad, cache=cache)
+        long_title = "ティファニー オープンハート ネックレス シルバー スモール ペンダント"
+        cand = {"title": long_title, "keyword": "ティファニー", "price": 1000, "postage": 0}
+        _m2, _c2 = _comps(self.p, cand, ad, cache=cache)
+        res = ybr_profit.evaluate(cand, self.p)
+        self.assertEqual(res["expected_sale"], 45000)  # 50,000 × 0.90
+
+    def test_trimmed_from_survives_cache(self):
+        """m18: 外れ値除外の元件数もキャッシュ経由で残る。"""
+        cache = _DictCache()
+        prices = [5000, 5100, 5200, 5300, 5400, 5500, 5600, 999999]
+        ad = _Adapter({"テスト 商品": prices})
+        _m1, c1 = _comps(self.p, {"title": "テスト 商品", "keyword": "テスト"},
+                         ad, cache=cache)
+        self.assertEqual(c1["trimmed_from"], 8)
+        _m2, c2 = _comps(self.p, {"title": "テスト 商品", "keyword": "テスト"},
+                         ad, cache=cache)
+        self.assertEqual(c2["trimmed_from"], 8)
+        self.assertEqual(c2["count"], 7)
+
+
+class TestCompsStatus(unittest.TestCase):
+    """C3: 「売切0件」と「未照会（予算切れ・失敗・中断）」を混ぜない。"""
+
+    def setUp(self):
+        self.p = build_profile("accessory", {})
+
+    def test_zero_hits_status(self):
+        cand = {"title": "存在しない 商品", "keyword": "存在しない"}
+        _mc, comps = _comps(self.p, cand, _Adapter({}))
+        self.assertIsNone(comps)
+        self.assertEqual(cand["comps_status"], "zero_hits")
+        self.assertTrue(cand["mercari_url"].startswith("https://jp.mercari.com/search?"))
+
+    def test_budget_exhausted_status(self):
+        cand = {"title": "テスト 商品", "keyword": "テスト"}
+        mc, comps = _comps(self.p, cand, _Adapter({}), budget=lambda _n: False)
+        self.assertIsNone(comps)
+        self.assertEqual(cand["comps_status"], "budget_exhausted")
+        self.assertTrue(mc.budget_exhausted)
+
+    def test_fetch_error_status(self):
+        cand = {"title": "テスト 商品", "keyword": "テスト"}
+        _mc, comps = _comps(self.p, cand, _Adapter(raise_always=True))
+        self.assertIsNone(comps)
+        self.assertEqual(cand["comps_status"], "fetch_error")
+
+    def test_aborted_status_after_three_failures(self):
+        ad = _Adapter(raise_always=True)
+        mc = mercari.MercariComps(self.p, NullCompsCache(), adapter=ad,
+                                  throttle_fn=lambda _s: None)
+        last = None
+        for i in range(4):
+            last = {"title": "テスト 商品 %d" % i, "keyword": "テスト"}
+            mc.fetch(last)
+        self.assertTrue(mc.aborted)
+        self.assertEqual(last["comps_status"], "aborted")
+
+    def test_no_query_status(self):
+        cand = {"title": "", "keyword": ""}
+        _mc, comps = _comps(self.p, cand, _Adapter({}))
+        self.assertIsNone(comps)
+        self.assertEqual(cand["comps_status"], "no_query")
+
+    def test_status_kind_labels_never_say_zero_for_unqueried(self):
+        for status in ("budget_exhausted", "fetch_error", "aborted", "blocked", "no_query"):
+            self.assertIn("未照会", mercari.STATUS_KIND[status], status)
+            self.assertNotIn("売切0件", mercari.STATUS_KIND[status], status)
+        self.assertIn("売切0件", mercari.STATUS_KIND["zero_hits"])
+
+
+class _HttpError(Exception):
+    def __init__(self, status):
+        class _R:
+            status_code = status
+        self.response = _R()
+        super().__init__("HTTP {}".format(status))
+
+
+class TestBlockedAndCounters(unittest.TestCase):
+    """C4 / M7: ブロック検出と「有効相場 vs HTTP成功」の分離。"""
+
+    def setUp(self):
+        self.p = build_profile("accessory", {})
+
+    def test_http_403_marks_blocked_and_aborts(self):
+        class AD:
+            calls = []
+
+            def search(self, q):
+                AD.calls.append(q)
+                raise _HttpError(403)
+
+        ad = AD()
+        mc = mercari.MercariComps(self.p, NullCompsCache(), adapter=ad,
+                                  throttle_fn=lambda _s: None)
+        cand = {"title": "テスト 商品", "keyword": "テスト"}
+        mc.fetch(cand)
+        self.assertTrue(mc.blocked)
+        self.assertEqual(mc.blocked_status, 403)
+        self.assertTrue(mc.aborted)
+        self.assertEqual(cand["comps_status"], "blocked")
+        # 2件目は照会しない（1回で止まる）
+        mc.fetch({"title": "別の 商品", "keyword": "別"})
+        self.assertEqual(len(AD.calls), 1)
+
+    def test_http_429_marks_blocked(self):
+        class AD:
+            def search(self, q):
+                raise _HttpError(429)
+
+        mc = mercari.MercariComps(self.p, NullCompsCache(), adapter=AD(),
+                                  throttle_fn=lambda _s: None)
+        mc.fetch({"title": "テスト 商品", "keyword": "テスト"})
+        self.assertEqual(mc.blocked_status, 429)
+
+    def test_cache_hit_counts_as_valid_comps_not_http(self):
+        cache = _DictCache()
+        ad = _Adapter({"テスト 商品": [1000, 2000, 3000]})
+        mc1 = mercari.MercariComps(self.p, cache, adapter=ad,
+                                   throttle_fn=lambda _s: None)
+        mc1.fetch({"title": "テスト 商品", "keyword": "テスト"})
+        self.assertEqual((mc1.valid_comps, mc1.http_successes, mc1.cache_hits), (1, 1, 0))
+
+        mc2 = mercari.MercariComps(self.p, cache, adapter=ad,
+                                   throttle_fn=lambda _s: None)
+        mc2.fetch({"title": "テスト 商品", "keyword": "テスト"})
+        self.assertEqual((mc2.valid_comps, mc2.http_successes, mc2.cache_hits), (1, 0, 1))
+        self.assertEqual(mc2.successes, 1)  # 後方互換の別名
+
+
+class TestTokenizeFixes(unittest.TestCase):
+    """M14 / M15: 括弧付き型番の保持と全角トークンの正規化。"""
+
+    def setUp(self):
+        self.acc = build_profile("accessory", {})
+        self.app = build_profile("apparel", {})
+
+    def test_parenthesized_model_numbers_are_kept(self):
+        q = mercari.build_queries(
+            {"title": "リーバイス (501) デニム", "keyword": "リーバイス"}, self.app)
+        self.assertIn("501", q[0][1])
+        qa = mercari.build_queries(
+            {"title": "ブルガリ (B-zero1) リング", "keyword": "ブルガリ"}, self.acc)
+        self.assertIn("B-zero1", qa[0][1])
+
+    def test_management_codes_in_parens_are_removed(self):
+        for code in ("(12678_0252)", "(1234567)", "(abc12345xyz)", "(1234-5678)"):
+            q = mercari.build_queries(
+                {"title": "ティファニー %s オープンハート" % code,
+                 "keyword": "ティファニー"}, self.acc)
+            self.assertNotIn(code.strip("()"), q[0][1], code)
+
+    def test_fullwidth_size_tokens_are_dropped(self):
+        q = mercari.build_queries(
+            {"title": "モンクレール ダウン Ｍ Ｗ３２ ＮＡＶＹ", "keyword": "モンクレール"},
+            self.app)
+        first = q[0][1]
+        self.assertNotIn("Ｍ", first)
+        self.assertNotIn("Ｗ３２", first)
+
+    def test_decorative_symbols_are_stripped(self):
+        """実走で発見: 「▽」のような装飾記号がクエリのトークンとして残っていた。"""
+        q = mercari.build_queries(
+            {"title": "▽ Tiffany&Co. ティファニー ◎ リターン トゥ ※",
+             "keyword": "ティファニー"}, self.acc)
+        first = q[0][1]
+        for sym in ("▽", "◎", "※"):
+            self.assertNotIn(sym, first)
+        self.assertIn("Tiffany&Co.", first)  # ブランド表記の & は残す
+
+    def test_fullwidth_noise_words_are_dropped(self):
+        q = mercari.build_queries(
+            {"title": "バーバリー トレンチコート 美品 ＵＳＥＤ", "keyword": "バーバリー"},
+            self.app)
+        self.assertNotIn("ＵＳＥＤ", q[0][1])
+
+
 class TestStats(unittest.TestCase):
     def test_iqr_trim_applies_at_8_or_more(self):
         prices = [5000, 5100, 5200, 5300, 5400, 5500, 5600, 999999]

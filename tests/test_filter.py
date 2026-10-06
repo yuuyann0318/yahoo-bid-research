@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from tests import ROOT  # noqa: F401
 from ybr import filter as ybr_filter
-from ybr.profiles import build_profile
+from ybr.profiles import build_profile, load_profile
 
 JST = timezone(timedelta(hours=9))
 NOW = datetime(2026, 10, 6, 12, 0, 0, tzinfo=JST)
@@ -29,14 +29,22 @@ class TestNormalize(unittest.TestCase):
 
 class TestNgHit(unittest.TestCase):
     def setUp(self):
-        self.acc = build_profile("accessory", {})
-        self.app = build_profile("apparel", {})
+        # brandTerms（<ブランド名>風 判定用）は load_profile が検索語ファイルから注入する
+        self.acc = load_profile("accessory")
+        self.app = load_profile("apparel")
+
+    def _hit(self, profile, title):
+        return ybr_filter.ng_hit(
+            title, profile["ngWords"], profile["allowPhrases"], profile["ngPatterns"],
+            brand_terms=profile.get("brandTerms"),
+            brand_suffix_words=profile.get("brandSuffixNgWords"),
+            allow_patterns=profile.get("allowPatterns"))
 
     def _acc(self, title):
-        return ybr_filter.ng_hit(title, self.acc["ngWords"], self.acc["allowPhrases"])
+        return self._hit(self.acc, title)
 
     def _app(self, title):
-        return ybr_filter.ng_hit(title, self.app["ngWords"], self.app["allowPhrases"])
+        return self._hit(self.app, title)
 
     def test_plain_copy_word_hits(self):
         self.assertIsNotNone(self._acc("ティファニー ネックレス コピー品"))
@@ -79,6 +87,79 @@ class TestNgHit(unittest.TestCase):
 
     def test_empty_title_is_none(self):
         self.assertIsNone(self._acc(""))
+
+    # --- M5: 品位+めっき表記（最頻表記）を検出する ---
+    def test_plating_marks_are_detected(self):
+        for title in ("K18GP ネックレス", "18KGP リング", "K14GF ブレス",
+                      "K18GF チェーン", "SV925GP ペンダント", "925GP リング",
+                      "18K GP ネックレス", "K18-GP リング", "18金GP",
+                      "gold plated ネックレス", "GOLD FILLED チェーン",
+                      "GP刻印 あり"):
+            self.assertIsNotNone(self._acc(title), title)
+
+    def test_plating_pattern_does_not_hit_gps_suffix(self):
+        self.assertIsNone(self._acc("K18 GPSケース"))
+
+    def test_k18gp_negation_is_rescued(self):
+        self.assertIsNone(self._acc("K18GPではありません 本物のK18"))
+
+    # --- M13: 救済は完全包含のときだけ ---
+    def test_supercopy_inside_copyright_is_not_rescued(self):
+        self.assertIsNotNone(self._app("バーバリー スーパーコピーライト 表記"))
+
+    def test_plain_copyright_is_rescued(self):
+        self.assertIsNone(self._app("バーバリー トレンチコート コピーライト 2026"))
+
+    # --- Codex#5: 区切り挿入による迂回（カタカナNG語） ---
+    def test_separator_inserted_katakana_ng_is_detected(self):
+        self.assertIsNotNone(self._acc("ティファニー レ プ リ カ ネックレス"))
+        self.assertIsNotNone(self._app("バーバリー コ・ピー 品"))
+
+    def test_separator_strip_does_not_break_long_vowel_words(self):
+        self.assertIsNotNone(self._app("シュプリーム コピー パーカー"))
+
+    # --- M23: 「風」「タイプ」はブランド名の直後だけNG ---
+    def test_brand_fu_is_ng(self):
+        self.assertIsNotNone(self._acc("ティファニー風 ネックレス シルバー"))
+
+    def test_brand_type_is_ng(self):
+        self.assertIsNotNone(self._app("バーバリータイプ トレンチコート"))
+
+    def test_brand_fu_with_separator_is_ng(self):
+        self.assertIsNotNone(self._app("モンクレール 風 ダウン"))
+
+    def test_harukaze_is_not_ng(self):
+        self.assertIsNone(self._app("春風コレクション シャツ"))
+
+    def test_a_type_is_not_ng(self):
+        self.assertIsNone(self._app("Aタイプ ジャケット 未使用"))
+
+    def test_standalone_fu_word_is_not_ng(self):
+        self.assertIsNone(self._app("北欧 インテリア 扇風機 カバー"))
+
+    # --- M10/M12/M23: アパレル語彙の修正 ---
+    def test_remake_is_ng(self):
+        self.assertIsNotNone(self._app("リーバイス リメイク デニムスカート"))
+
+    def test_mushikui_is_ng(self):
+        self.assertIsNotNone(self._app("カシミヤ ニット 虫食い あり"))
+
+    def test_shimi_ari_is_ng(self):
+        for title in ("シャツ シミあり", "コート シミ有", "ニット シミ多", "シャツ 染みあり"):
+            self.assertIsNotNone(self._app(title), title)
+
+    def test_cashmere_is_not_ng(self):
+        """「シミ」単独をNG/注意にすると カシミヤ・カシミア に誤爆する（M23）。"""
+        for title in ("カシミヤ 100% コート", "カシミア ニット 極美品"):
+            self.assertIsNone(self._app(title), title)
+            self.assertEqual(
+                ybr_filter.caution_hits(title, self.app["cautionWords"]), [], title)
+
+    def test_damage_sukoshi_is_not_rescued_and_is_caution(self):
+        """M12: 「ダメージ少」は救済語ではなく注意語。"""
+        self.assertNotIn("ダメージ少", self.app["allowPhrases"])
+        self.assertIn("ダメージ少", self.app["cautionWords"])
+        self.assertIsNotNone(self._app("リーバイス ダメージ少なめ"))
 
 
 def _item(aid="x1", title="ティファニー オープンハート", price=12000, postage=0, minutes=1440):

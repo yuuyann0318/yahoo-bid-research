@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import re
 import statistics
+import unicodedata
 import urllib.parse
 
 from . import throttle as throttle_module
@@ -27,7 +28,20 @@ STATUS_SOLD_OUT = "ITEM_STATUS_SOLD_OUT"
 # adapter例外がこの回数連続したら「全滅障害」とみなし以降の照会を中断する
 MAX_CONSECUTIVE_FAILURES = 3
 
+# メルカリ側にブロックされたと判断する HTTP ステータス（即時中断・C4）
+BLOCKED_STATUSES = (403, 429)
+
 FETCH_ERROR_REASON = "相場取得失敗(通信/依存エラー)"
+
+# comps_status -> 不採用の区分ラベル（C3: 「売切0件」と「未照会」を絶対に混ぜない）
+STATUS_KIND = {
+    "zero_hits": "相場不明(メルカリ売切0件)",
+    "no_query": "相場未照会(クエリを作れず)",
+    "budget_exhausted": "相場未照会(メルカリ予算切れ)",
+    "fetch_error": "相場未照会(取得失敗)",
+    "aborted": "相場未照会(連続失敗で照会中断)",
+    "blocked": "相場未照会(メルカリにブロック)",
+}
 
 # クエリ語数の段階（fallback_level: 0=6語, 1=3語, 2=2語）
 _TOKEN_STEPS = ((0, 6), (1, 3), (2, 2))
@@ -101,14 +115,35 @@ def sold_search_url(query):
     return _SOLD_SEARCH_BASE + "?" + urllib.parse.urlencode(params)
 
 
+# 括弧の中身が「管理番号」とみなせる形（M14）。
+# これ以外は中身を残して括弧だけ外す（(501) や (B-zero1) のような実在型番を守る）。
+_MGMT_CODE_RE = re.compile(
+    r"^(?:"
+    r"[0-9a-z]*_[0-9a-z_\-]*"       # アンダースコア入り: 12678_0252
+    r"|\d{5,}"                      # 5桁以上の連番
+    r"|[0-9a-z]{8,}"                # 8文字以上の英数字の羅列
+    r"|\d{3,}[-]\d{3,}"             # 1234-5678
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def _strip_brackets(match):
+    """括弧の中身が管理番号なら捨て、そうでなければ中身を残す（M14）。"""
+    inner = match.group(1)
+    if _MGMT_CODE_RE.match(inner):
+        return " "
+    return " " + inner + " "
+
+
 def _clean_title(title):
-    """タイトルを検索語向けに整える（管理番号・括弧記号の除去→空白区切り）。"""
+    """タイトルを検索語向けに整える（管理番号の除去・括弧記号の除去→空白区切り）。"""
     if not title:
         return ""
-    s = re.sub(r"[（(][0-9A-Za-z_\-]+[)）]", " ", title)
+    s = re.sub(r"[（(]\s*([0-9A-Za-z_\-]+)\s*[)）]", _strip_brackets, title)
     s = re.sub(
-        r"[【】\[\]（）()「」『』〈〉《》/／・|,、。!！?？☆★■□◆◇●○～〜×"
-        r"＜＞<>#＃*＊+＋:：;；\"'`^~_]+", " ", s)
+        r"[【】\[\]（）()「」『』〈〉《》〔〕｛｝{}/／・|,、。!！?？☆★■□◆◇●○◎"
+        r"▽△▼▲※→←↑↓♪♡♥〓–—―~〜～×＜＞<>#＃*＊+＋:：;；\"'`^_]+", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
 
@@ -122,9 +157,17 @@ def _compiled_drops(profile):
     return out
 
 
+def _norm_token(word):
+    """判定用のトークン正規化: NFKC + 小文字化（全角「Ｍ」「Ｗ３２」対策・M15）。"""
+    return unicodedata.normalize("NFKC", str(word or "")).strip().lower()
+
+
 def tokenize(candidate, profile):
-    """相場クエリ用のトークン列（ノイズ語・サイズ/色等・数値のみの語を除去）。"""
-    noise = {str(w).lower() for w in (profile.get("noiseWords") or ())}
+    """相場クエリ用のトークン列（ノイズ語・サイズ/色等・数値のみの語を除去）。
+
+    判定は NFKC 正規化後の文字列で行い、クエリには元の表記を入れる（M15）。
+    """
+    noise = {_norm_token(w) for w in (profile.get("noiseWords") or ())}
     drops = _compiled_drops(profile)
     tokens = []
     seen = set()
@@ -133,13 +176,13 @@ def tokenize(candidate, profile):
         w = (word or "").strip()
         if not w:
             return
-        key = w.lower()
-        if key in seen:
+        key = _norm_token(w)
+        if not key or key in seen:
             return
-        if key in noise or _is_noise_number(w):
+        if key in noise or _is_noise_number(key):
             return
         for rx in drops:
-            if rx.match(w):
+            if rx.match(key):
                 return
         seen.add(key)
         tokens.append(w)
@@ -200,14 +243,39 @@ class MercapiAdapter:
         return asyncio.run(_run())
 
 
+def _http_status_of(error):
+    """例外から HTTP ステータスを取り出す（httpx / urllib / 文字列のいずれでも）。"""
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    if status is None:
+        status = getattr(error, "status_code", None)
+    if status is None:
+        status = getattr(error, "code", None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+# 統計としてキャッシュに保存するキー。fallback_level / query / cache_hit は**保存しない**
+# （C1: クエリ文字列が同じでも縮退段数は候補ごとに違うため、取得時に毎回決める）。
+_CACHE_STAT_KEYS = ("count", "median", "p25", "p75", "min", "max", "mean", "trimmed_from")
+
+
 class MercariComps:
     """候補1件のメルカリ売切相場(comps)を取得する。
 
     - profile: mercariMinIntervalSec を throttle に使う
-    - cache: get(query)/put(query, comps)
+    - cache: get(query)/put(query, stats)
     - adapter: search(query)->list[item-like]（省略時は実 mercapi）
     - budget: callable(n)->bool（False=予算切れ。fetch は None を返す）
     - throttle_fn: テスト注入用（省略時は最小2.0秒のハードfloorが効く）
+
+    集計（M7）:
+      valid_comps     … 有効な相場を得た件数（キャッシュ命中も含む）
+      http_successes  … 実際に adapter.search が成功した回数
+    状態（C3/C4）: candidate["comps_status"] に ok / zero_hits / fetch_error /
+      aborted / blocked / budget_exhausted / no_query を必ず入れる。
     """
 
     def __init__(self, profile, cache, adapter=None, budget=None, throttle_fn=None):
@@ -221,34 +289,77 @@ class MercariComps:
         except (TypeError, ValueError):
             self.min_interval = 2.5
         self.requests_made = 0
-        self.successes = 0
+        self.http_successes = 0
+        self.valid_comps = 0
+        self.cache_hits = 0
         self.budget_exhausted = False
         self.fetch_failures = 0
         self.aborted = False
+        self.blocked = False
+        self.blocked_status = None
         self.last_error = None
         self._consecutive_failures = 0
+
+    # 後方互換（旧名）。意味は「有効相場の件数」。
+    @property
+    def successes(self):
+        return self.valid_comps
+
+    def _comps_from_stats(self, stats, query, level, cache_hit):
+        """統計 + 「今回の」縮退段数から comps を組む（C1）。"""
+        comps = {"query": query, "fallback_level": int(level), "cache_hit": bool(cache_hit)}
+        for key in _CACHE_STAT_KEYS:
+            if stats.get(key) is not None:
+                comps[key] = stats[key]
+        return comps
+
+    def _fail(self, candidate, status, reason, url_query=None):
+        candidate["comps_status"] = status
+        candidate["comps_error"] = reason
+        if url_query:
+            candidate["mercari_url"] = sold_search_url(url_query)
+        return None
 
     def fetch(self, candidate):
         """candidate の comps を取得して返す（candidate["comps"] にも入れる）。
 
-        取得不能は None。adapter例外は candidate["comps_error"] に残す
-        （「売切0件（相場不明）」と「取得失敗」を混同しないため）。例外は外に漏らさない。
+        取得不能は None。そのとき candidate["comps_status"] で
+        「売切0件（相場不明）」と「未照会／取得失敗」を必ず区別する（C3）。
+        例外は外に漏らさない。
         """
+        attempts = build_queries(candidate, self.profile)
+        if not attempts:
+            return self._fail(candidate, "no_query", "相場クエリを作れなかった(タイトルから語が取れない)")
+        first_query = attempts[0][1]
+
+        if self.blocked:
+            return self._fail(
+                candidate, "blocked",
+                "メルカリ側にブロックされ照会中断(HTTP {})".format(self.blocked_status),
+                first_query)
         if self.aborted:
-            candidate["comps_error"] = self.last_error or "連続失敗により照会中断"
-            return None
-        for level, query in build_queries(candidate, self.profile):
+            return self._fail(
+                candidate, "aborted",
+                self.last_error or "連続失敗により照会中断", first_query)
+
+        for level, query in attempts:
             cached = self.cache.get(query)
             if cached is not None:
-                comps = dict(cached)
-                comps["cache_hit"] = True
+                comps = self._comps_from_stats(cached, query, level, True)
+                if int(comps.get("count", 0) or 0) <= 0:
+                    continue  # 0件はキャッシュしないが、念のため縮退を続ける
+                self.valid_comps += 1
+                self.cache_hits += 1
                 candidate["comps"] = comps
-                candidate["mercari_url"] = sold_search_url(comps.get("query") or query)
+                candidate["comps_status"] = "ok"
+                candidate["mercari_url"] = sold_search_url(query)
                 return comps
 
             if self.budget is not None and not self.budget(1):
                 self.budget_exhausted = True
-                return None
+                return self._fail(
+                    candidate, "budget_exhausted",
+                    "メルカリ照会の予算切れで未照会", first_query)
 
             self.throttle_fn(self.min_interval)
             self.requests_made += 1
@@ -258,39 +369,39 @@ class MercariComps:
                 self.fetch_failures += 1
                 self._consecutive_failures += 1
                 self.last_error = "{}: {}".format(e.__class__.__name__, str(e)[:120])
-                candidate["comps_error"] = self.last_error
+                status = _http_status_of(e)
+                if status in BLOCKED_STATUSES:
+                    self.blocked = True
+                    self.blocked_status = status
+                    self.aborted = True
+                    return self._fail(
+                        candidate, "blocked",
+                        "メルカリ側にブロックされました(HTTP {})".format(status), first_query)
                 if self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                     self.aborted = True
-                return None
+                    return self._fail(
+                        candidate, "aborted",
+                        "{}回連続で失敗し照会中断({})".format(
+                            self._consecutive_failures, self.last_error), first_query)
+                return self._fail(candidate, "fetch_error", self.last_error, first_query)
             self._consecutive_failures = 0
+            self.http_successes += 1
 
             prices = extract_prices(raw_items)
             if not prices:
                 continue  # 次の（短い）クエリへ縮退
 
-            st = compute_stats(prices)
-            comps = {
-                "query": query,
-                "count": st["count"],
-                "median": st["median"],
-                "p25": st["p25"],
-                "p75": st["p75"],
-                "min": st["min"],
-                "max": st["max"],
-                "mean": st["mean"],
-                "fallback_level": level,
-                "cache_hit": False,
-            }
-            if "trimmed_from" in st:
-                comps["trimmed_from"] = st["trimmed_from"]
-            self.cache.put(query, comps)
-            self.successes += 1
+            stats = compute_stats(prices)
+            # キャッシュには統計だけを保存する（縮退段数・係数は毎回決める・C1）
+            self.cache.put(query, {k: stats[k] for k in _CACHE_STAT_KEYS if k in stats})
+            comps = self._comps_from_stats(stats, query, level, False)
+            self.valid_comps += 1
             candidate["comps"] = comps
+            candidate["comps_status"] = "ok"
             candidate["mercari_url"] = sold_search_url(query)
             return comps
 
-        # 全クエリで有効価格0件。参照用URLだけは最初のクエリで残す（捏造はしない）。
-        attempts = build_queries(candidate, self.profile)
-        if attempts:
-            candidate["mercari_url"] = sold_search_url(attempts[0][1])
+        # 全クエリで有効価格0件（照会はできた）。参照用URLは残す。捏造はしない。
+        candidate["comps_status"] = "zero_hits"
+        candidate["mercari_url"] = sold_search_url(first_query)
         return None

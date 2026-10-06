@@ -139,8 +139,56 @@ class TestResolveCategory(unittest.TestCase):
     def test_known_apparel_keyword(self):
         self.assertEqual(profiles.resolve_category("モンクレール ダウン"), "apparel")
 
-    def test_unknown_defaults_to_apparel_conservatively(self):
-        self.assertEqual(profiles.resolve_category("謎のブランド 謎の商品"), "apparel")
+    def test_undecidable_keyword_is_unknown(self):
+        """M11: 判定できない語は apparel と断定せず unknown にする。"""
+        self.assertEqual(profiles.resolve_category("謎のブランド 謎の商品"), "unknown")
+
+
+class TestUnionProfile(unittest.TestCase):
+    """M11: カテゴリ不明の語は送料だけでなくNG語も保守側（両カテゴリの和集合）にする。"""
+
+    def setUp(self):
+        self.union = profiles.load_union_profile()
+
+    def test_shipping_is_apparel_side(self):
+        self.assertEqual(self.union["sellShippingYen"], 850)
+
+    def test_category_is_unknown(self):
+        self.assertEqual(self.union["category"], "unknown")
+
+    def test_ng_words_include_both_categories(self):
+        for word in ("めっき", "GP", "石取れ"):          # accessory 側
+            self.assertIn(word, self.union["ngWords"], word)
+        for word in ("リメイク", "虫食い", "破れ"):        # apparel 側
+            self.assertIn(word, self.union["ngWords"], word)
+
+    def test_jewelry_ng_applies_to_unknown_keyword(self):
+        from ybr import filter as ybr_filter
+        hit = ybr_filter.ng_hit("シャネル ピアス K18GP", self.union["ngWords"],
+                                self.union["allowPhrases"], self.union["ngPatterns"])
+        self.assertIsNotNone(hit)
+
+    def test_profile_for_resolved_dispatches(self):
+        self.assertEqual(
+            profiles.profile_for_resolved("unknown")["category"], "unknown")
+        self.assertEqual(
+            profiles.profile_for_resolved("accessory")["sellShippingYen"], 300)
+
+
+class TestBrandTerms(unittest.TestCase):
+    def test_brand_terms_come_from_keywords_file(self):
+        terms = profiles.brand_terms("apparel")
+        self.assertIn("モンクレール", terms)
+        self.assertIn("バーバリー", terms)
+
+    def test_load_profile_injects_brand_terms(self):
+        p = profiles.load_profile("accessory")
+        self.assertTrue(p["brandTerms"])
+        self.assertIn("ティファニー", p["brandTerms"])
+
+    def test_brand_suffix_words_present(self):
+        for cat in ("accessory", "apparel"):
+            self.assertIn("風", profiles.load_profile(cat)["brandSuffixNgWords"])
 
 
 if __name__ == "__main__":

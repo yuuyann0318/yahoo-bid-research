@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -41,11 +42,23 @@ MAX_CONSECUTIVE_YAHOO_FAILURES = 3
 
 
 # --- 引数 ---------------------------------------------------------------------
+class UsageErrorParser(argparse.ArgumentParser):
+    """引数エラーを終了コード1にする（M8。既定の2は「採用0件」と衝突する）。"""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        sys.stderr.write("{}: error: {}\n".format(self.prog, message))
+        raise SystemExit(EXIT_USAGE)
+
+
 def _margin(value):
     try:
         v = float(value)
     except (TypeError, ValueError):
         raise argparse.ArgumentTypeError("--margin は数値で指定してください: {}".format(value))
+    if not math.isfinite(v):  # nan / inf を弾く（m17 / Codex#18）
+        raise argparse.ArgumentTypeError(
+            "--margin に非有限値は使えません: {}".format(value))
     if v < ybr_profit.MIN_TARGET_MARGIN_PCT or v > ybr_profit.MAX_TARGET_MARGIN_PCT:
         raise argparse.ArgumentTypeError(
             "--margin は {:.0f}〜{:.0f} の範囲で指定してください: {}".format(
@@ -68,7 +81,7 @@ def _csv_list(value):
 
 
 def build_run_parser():
-    p = argparse.ArgumentParser(
+    p = UsageErrorParser(
         prog="ybr run",
         description="ヤフオクの入札候補をリストアップする（入札はしない）",
     )
@@ -107,10 +120,14 @@ class _Budget:
         self.daily = daily
         self.used = 0
         self.blocked_by = None
+        self.hit_run_limit = False
+        self.hit_daily_limit = False
 
     def remaining(self):
         run_left = max(0, self.run_limit - self.used)
         day_left = self.daily.remaining(self.kind) if self.daily else run_left
+        if day_left <= 0 and self.daily is not None:
+            self.hit_daily_limit = True
         return min(run_left, day_left)
 
     def block_reason(self):
@@ -127,9 +144,12 @@ class _Budget:
             return True
         if self.used + n > self.run_limit:
             self.blocked_by = "1実行の上限({}回)".format(self.run_limit)
+            self.hit_run_limit = True
             return False
         if self.daily is not None and not self.daily.spend(self.kind, n):
             self.blocked_by = "日次上限({}回)".format(self.daily.limits.get(self.kind))
+            # 日次上限は「異常」扱い（部分結果で成功にしない・Codex#3）
+            self.hit_daily_limit = True
             return False
         self.used += n
         return True
@@ -156,34 +176,61 @@ class _Logger:
 
 
 # --- 検索語の割り当て ---------------------------------------------------------
-def _interleave(groups):
-    """[(cat, [kw...]), ...] をカテゴリ交互に並べる（上限打ち切りで片方が消えないように）。"""
+def _round_robin(groups):
+    """[(key, [item...]), ...] を順番に1つずつ取り出して並べる。"""
     out = []
     index = 0
     while True:
         added = False
-        for cat, kws in groups:
-            if index < len(kws):
-                out.append((cat, kws[index]))
+        for _key, items in groups:
+            if index < len(items):
+                out.append(items[index])
                 added = True
         if not added:
             return out
         index += 1
 
 
+def _brand_of(keyword):
+    """検索語の先頭トークンをブランドとみなす（m25 のラウンドロビンのキー）。"""
+    parts = str(keyword or "").split()
+    return parts[0] if parts else str(keyword or "")
+
+
+def _brand_round_robin(category, keywords):
+    """同一カテゴリ内をブランド間ラウンドロビンにする（m25）。
+
+    --max-yahoo-requests が小さいとき、先頭ブランド（ティファニー4語）に偏って
+    他ブランドが1語も実行されない問題を防ぐ。
+    """
+    groups = []
+    order = []
+    for kw in keywords:
+        brand = _brand_of(kw)
+        if brand not in order:
+            order.append(brand)
+            groups.append((brand, []))
+        for key, items in groups:
+            if key == brand:
+                items.append((category, kw))
+                break
+    return _round_robin(groups)
+
+
 def resolve_jobs(args, base_dir=None):
-    """(category, keyword) のリストを決める。"""
+    """(category, keyword) のリストを決める。category は accessory/apparel/unknown。"""
     cats = ("accessory", "apparel") if args.category == "both" else (args.category,)
     if args.keywords:
         if args.category == "both":
-            # カテゴリ未指定の明示検索語は語ごとに推定する（不明は apparel=保守的な送料）
+            # カテゴリ未指定の明示検索語は語ごとに推定する。
+            # 判定できない語は "unknown"（送料はアパレル=高い側、NG語は両カテゴリの和集合・M11）
             return [(ybr_profiles.resolve_category(k, base_dir), k) for k in args.keywords]
         return [(cats[0], k) for k in args.keywords]
     groups = []
     for cat in cats:
-        groups.append((cat, ybr_profiles.load_keywords(
-            cat, base_dir=base_dir, brands=args.brands)))
-    return _interleave(groups)
+        kws = ybr_profiles.load_keywords(cat, base_dir=base_dir, brands=args.brands)
+        groups.append((cat, _brand_round_robin(cat, kws)))
+    return _round_robin(groups)
 
 
 def _profile_for(category, args, base_dir=None):
@@ -196,7 +243,8 @@ def _profile_for(category, args, base_dir=None):
     }
     if args.max_candidates:
         overrides["maxCandidates"] = int(args.max_candidates)
-    return ybr_profiles.load_profile(category, base_dir=base_dir, overrides=overrides)
+    return ybr_profiles.profile_for_resolved(
+        category, base_dir=base_dir, overrides=overrides)
 
 
 
@@ -265,41 +313,48 @@ def run(argv=None, deps=None, base_dir=None):
                margin=args.margin, top=args.top, out=out_dir)
 
     # ---- 1) ヤフオク検索 ----
+    # 予算計上は search_keyword 側に任せる（全ページの初回HTTPを計上する・M6）。
+    # 連続失敗は HTTP試行単位で数える（検索語単位だと実質9回続く・m22）。
     raw_by_cat = {}
     yahoo_items = 0
     attempted = 0
+    executed = 0
     failures = 0
-    consecutive = 0
+    yahoo_last_error = None
+    tracker = ybr_yahoo.FailureTracker(MAX_CONSECUTIVE_YAHOO_FAILURES)
     for cat, keyword in jobs:
         if yahoo_budget.remaining() <= 0:
             stop_reason = yahoo_budget.block_reason()
             notes.append("ヤフオク検索を打ち切り: {}（残りの検索語{}語は未実行）".format(
                 stop_reason, len(jobs) - attempted))
             break
-        if not yahoo_budget.spend(1):
-            stop_reason = yahoo_budget.block_reason()
-            notes.append("ヤフオク検索を打ち切り: {}".format(stop_reason))
-            break
         attempted += 1
         try:
             items, warning = ybr_yahoo.search_keyword(
                 keyword, pages=args.pages, fetcher=fetcher,
-                spend=yahoo_budget.spend, now=now)
+                spend=yahoo_budget.spend, now=now, tracker=tracker)
         except ybr_yahoo.BlockedError as e:
+            # C2: 403/429 は全カテゴリの取得を止めて exit3（次の検索語へ進まない）
             degraded = str(e)
             logger.log("yahoo_blocked", keyword=keyword, status=e.status)
             break
+        except ybr_yahoo.BudgetExhausted as e:
+            stop_reason = yahoo_budget.block_reason()
+            notes.append("ヤフオク検索を打ち切り: {}（{}）".format(stop_reason, str(e)[:80]))
+            break
+        except ybr_yahoo.ConsecutiveFailureError as e:
+            failures += 1
+            yahoo_last_error = e.last_error
+            degraded = str(e)
+            logger.log("yahoo_consecutive_failure", keyword=keyword,
+                       consecutive=e.consecutive, error=e.last_error)
+            break
         except Exception as e:  # noqa: BLE001 - 通信断等
             failures += 1
-            consecutive += 1
-            logger.log("yahoo_failed", keyword=keyword,
-                       error="{}: {}".format(e.__class__.__name__, str(e)[:160]))
-            if consecutive >= MAX_CONSECUTIVE_YAHOO_FAILURES:
-                degraded = "ヤフオク取得が{}回連続で失敗しました（{}）".format(
-                    consecutive, "{}: {}".format(e.__class__.__name__, str(e)[:120]))
-                break
+            yahoo_last_error = "{}: {}".format(e.__class__.__name__, str(e)[:120])
+            logger.log("yahoo_failed", keyword=keyword, error=yahoo_last_error)
             continue
-        consecutive = 0
+        executed += 1
         if warning:
             notes.append(warning)
             logger.log("yahoo_warning", keyword=keyword, warning=warning)
@@ -309,11 +364,21 @@ def run(argv=None, deps=None, base_dir=None):
         yahoo_items += len(items)
         logger.log("yahoo_ok", keyword=keyword, items=len(items))
 
-    if degraded is None and attempted == 0:
+    if degraded is None and executed == 0:
         degraded = "ヤフオク検索を1回も実行できませんでした（{}）".format(
-            stop_reason or ("検索語が0件" if not jobs else yahoo_budget.block_reason()))
+            yahoo_last_error or stop_reason
+            or ("検索語が0件" if not jobs else yahoo_budget.block_reason()))
     if degraded is None and failures and yahoo_items == 0:
-        degraded = "ヤフオク取得が全て失敗しました（{}件の検索語で0件）".format(failures)
+        degraded = "ヤフオク取得が全て失敗しました（{}語で0件 / {}）".format(
+            failures, yahoo_last_error or "原因不明")
+    # Codex#3: 日次上限での途中打ち切りは部分結果なので成功扱いにしない
+    if degraded is None and yahoo_budget.hit_daily_limit:
+        degraded = "ヤフオクの日次上限({}回)に到達し途中で打ち切りました（部分結果）".format(
+            daily.limits.get("yahoo"))
+    # M16: 連続していないヤフオク失敗も result.md / meta に出す（run.log だけに埋めない）
+    if failures and degraded is None:
+        notes.append("ヤフオク取得に失敗した検索語が{}語あります（{}）".format(
+            failures, yahoo_last_error or "原因不明"))
 
     # ---- 2) 一次フィルタ ----
     kept = []
@@ -330,7 +395,7 @@ def run(argv=None, deps=None, base_dir=None):
     adopted = []
     for cand in kept:
         cat = cand.get("category")
-        profile = profiles_by_cat.get(cat) or ybr_profiles.build_profile("apparel", {})
+        profile = profiles_by_cat.get(cat) or ybr_profiles.load_union_profile(base_dir)
         client = comps_clients.get(cat)
         if client is None:
             client = ybr_mercari.MercariComps(
@@ -341,35 +406,68 @@ def run(argv=None, deps=None, base_dir=None):
             )
             comps_clients[cat] = client
         if mercari_budget.remaining() <= 0:
-            cand["excluded_reason"] = "メルカリ照会の上限に到達（未照会）"
-            cand["excluded_kind"] = "メルカリ照会の上限で未照会"
+            cand["comps_status"] = "budget_exhausted"
+            cand["excluded_reason"] = "メルカリ照会の上限に到達（未照会・{}）".format(
+                mercari_budget.block_reason())
+            cand["excluded_kind"] = ybr_mercari.STATUS_KIND["budget_exhausted"]
             excluded.append(cand)
             continue
         client.fetch(cand)
         result = ybr_profit.evaluate(cand, profile)
         cand["profit"] = result
-        if cand.get("comps_error") and not (cand.get("comps") or {}).get("count"):
-            cand["excluded_reason"] = ybr_mercari.FETCH_ERROR_REASON
-            cand["excluded_kind"] = ybr_mercari.FETCH_ERROR_REASON
+        status = cand.get("comps_status")
+        # C3: 「売切0件（相場不明）」と「未照会（予算切れ・取得失敗・中断）」を混ぜない
+        if status not in (None, "ok", "zero_hits"):
+            cand["excluded_reason"] = "{}: {}".format(
+                ybr_mercari.STATUS_KIND.get(status, "相場未照会"),
+                cand.get("comps_error") or "詳細不明")
+            cand["excluded_kind"] = ybr_mercari.STATUS_KIND.get(status, "相場未照会")
             excluded.append(cand)
             continue
         if not result["ok"]:
             cand["excluded_reason"] = result["reason"]
-            cand["excluded_kind"] = _profit_reason_kind(result)
+            cand["excluded_kind"] = (
+                ybr_mercari.STATUS_KIND["zero_hits"] if status == "zero_hits"
+                else _profit_reason_kind(result))
             excluded.append(cand)
             continue
         adopted.append(cand)
 
     mercari_requests = sum(c.requests_made for c in comps_clients.values())
-    mercari_successes = sum(c.successes for c in comps_clients.values())
+    mercari_valid = sum(c.valid_comps for c in comps_clients.values())
+    mercari_http_ok = sum(c.http_successes for c in comps_clients.values())
+    mercari_cache_hits = sum(c.cache_hits for c in comps_clients.values())
     mercari_aborted = any(c.aborted for c in comps_clients.values())
+    mercari_blocked = next(
+        (c.blocked_status for c in comps_clients.values() if c.blocked), None)
     mercari_failures = sum(c.fetch_failures for c in comps_clients.values())
-    logger.log("mercari", requests=mercari_requests, successes=mercari_successes,
-               failures=mercari_failures, aborted=mercari_aborted)
+    logger.log("mercari", requests=mercari_requests, valid_comps=mercari_valid,
+               http_successes=mercari_http_ok, cache_hits=mercari_cache_hits,
+               failures=mercari_failures, aborted=mercari_aborted,
+               blocked_status=mercari_blocked)
 
-    if degraded is None and kept and mercari_successes == 0 and mercari_failures > 0:
+    # C4: ブロック・連続失敗の中断は「成功件数に関係なく」exit3 + ⚠️バナー
+    mercari_degraded = None
+    if mercari_blocked is not None:
+        mercari_degraded = "メルカリ相場の取得がブロックされ中断しました(HTTP {})".format(
+            mercari_blocked)
+    elif mercari_aborted:
+        last = next((c.last_error for c in comps_clients.values() if c.last_error), "")
+        mercari_degraded = "メルカリ相場の取得が{}回連続で失敗し中断しました（{}）".format(
+            ybr_mercari.MAX_CONSECUTIVE_FAILURES, last or "原因不明")
+    if mercari_degraded is not None:
+        if degraded is None:
+            degraded = mercari_degraded
+        else:
+            # ヤフオク側の理由を上書きしない（どちらも exit3。両方を残す）
+            notes.append(mercari_degraded)
+    elif degraded is None and kept and mercari_valid == 0 and mercari_failures > 0:
+        # M7: キャッシュ命中は「有効相場」に数えるので、ここは本当に1件も無いときだけ
         last = next((c.last_error for c in comps_clients.values() if c.last_error), "")
         degraded = "メルカリ相場の取得が全て失敗しました（{}）".format(last or "原因不明")
+    elif degraded is None and mercari_budget.hit_daily_limit:
+        degraded = "メルカリの日次上限({}回)に到達し途中で打ち切りました（部分結果）".format(
+            daily.limits.get("mercari"))
 
     # ---- 5) 並べ替え・上位抽出 ----
     adopted.sort(key=lambda c: (
@@ -382,8 +480,6 @@ def run(argv=None, deps=None, base_dir=None):
             c["excluded_kind"] = "上位{}件の枠外".format(args.top)
             excluded.append(c)
         adopted = adopted[:args.top]
-
-    history.mark(adopted)
 
     # 内訳は「種類」で集計する（金額入りの文言でキーが散ると0件の理由が読めない）。
     reasons = {}
@@ -403,15 +499,24 @@ def run(argv=None, deps=None, base_dir=None):
             "generated_at": now.isoformat(),
             "categories": sorted({c for c, _ in jobs}) or [args.category],
             "keywords": [k for _c, k in jobs],
+            "keywords_planned": len(jobs),
+            "keywords_executed": executed,
             "margin_pct": effective_margin,
             "margin_pct_requested": float(args.margin),
             "top": int(args.top),
             "yahoo_requests": yahoo_budget.used,
             "yahoo_items": yahoo_items,
+            "yahoo_failures": failures,
+            "yahoo_last_error": yahoo_last_error,
             "prefilter_kept": len(kept),
             "mercari_requests": mercari_requests,
-            "mercari_successes": mercari_successes,
+            "mercari_valid_comps": mercari_valid,
+            "mercari_http_successes": mercari_http_ok,
+            "mercari_cache_hits": mercari_cache_hits,
+            "mercari_successes": mercari_valid,  # 後方互換（意味=有効相場の件数）
             "mercari_failures": mercari_failures,
+            "mercari_blocked_status": mercari_blocked,
+            "mercari_aborted": mercari_aborted,
             "adopted_count": len(adopted),
             "excluded_count": len(excluded),
             "excluded_reasons": reasons,
@@ -419,6 +524,8 @@ def run(argv=None, deps=None, base_dir=None):
             "exit_code": exit_code,
             "degraded": degraded,
             "notes": notes,
+            "warnings": list(daily.warnings),
+            "budget_save_failed": daily.save_failed,
             "out_dir": out_dir,
             "state_dir": state_dir,
             "version": "0.1.0",
@@ -428,6 +535,13 @@ def run(argv=None, deps=None, base_dir=None):
     }
 
     paths = ybr_report.write_outputs(payload, out_dir)
+    # M9: レポート出力が成功し、かつ終了コードが 0/2 のときだけ履歴に残す
+    # （exit3 の部分結果を「報告済み」にすると7日間再掲されない）
+    if exit_code in (EXIT_OK, EXIT_NO_CANDIDATES):
+        history.mark(adopted)
+        logger.log("history_marked", count=len(adopted))
+    else:
+        logger.log("history_skipped", reason="exit_code={}".format(exit_code))
     logger.log("run_end", exit_code=exit_code, adopted=len(adopted),
                elapsed_sec=payload["meta"]["elapsed_sec"])
     return {"exit_code": exit_code, "payload": payload, "paths": paths}
@@ -436,7 +550,7 @@ def run(argv=None, deps=None, base_dir=None):
 # --- selftest ----------------------------------------------------------------
 def selftest(argv=None, base_dir=None):
     """ネットワークを使わずに環境と設定を点検する。"""
-    p = argparse.ArgumentParser(prog="ybr selftest")
+    p = UsageErrorParser(prog="ybr selftest")
     p.add_argument("--state-dir", default=None)
     args = p.parse_args(argv or [])
     base_dir = base_dir or PROJECT_ROOT

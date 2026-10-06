@@ -147,5 +147,149 @@ class TestSearchKeyword(unittest.TestCase):
             yahoo.search_keyword("テスト", fetcher=boom)
 
 
+class TestBlockedOnLaterPages(unittest.TestCase):
+    """C2: 2ページ目以降の 403/429 を握り潰すと403連打になる。必ず再送出する。"""
+
+    def test_second_page_403_raises(self):
+        calls = []
+
+        def fetcher(url):
+            calls.append(url)
+            if len(calls) == 1:
+                return _fixture_html()
+            raise urllib.error.HTTPError(url, 403, "Forbidden", None, None)
+
+        with self.assertRaises(yahoo.BlockedError):
+            yahoo.search_keyword("テスト", pages=3, fetcher=fetcher)
+        self.assertEqual(len(calls), 2)  # 3ページ目は取りに行かない
+
+    def test_second_page_429_raises(self):
+        calls = []
+
+        def fetcher(url):
+            calls.append(url)
+            if len(calls) == 1:
+                return _fixture_html()
+            raise urllib.error.HTTPError(url, 429, "Too Many", None, None)
+
+        with self.assertRaises(yahoo.BlockedError):
+            yahoo.search_keyword("テスト", pages=2, fetcher=fetcher)
+
+    def test_second_page_normal_error_keeps_first_page(self):
+        calls = []
+
+        def fetcher(url):
+            calls.append(url)
+            if len(calls) == 1:
+                return _fixture_html()
+            raise OSError("timeout")
+
+        items, warning = yahoo.search_keyword("テスト", pages=2, fetcher=fetcher)
+        self.assertEqual(len(items), 10)
+        self.assertIsNone(warning)
+
+
+class TestPageBudget(unittest.TestCase):
+    """M6: 全ページの初回HTTPを予算計上する（--pages 4 を予算1回で取らせない）。"""
+
+    def test_every_page_spends_budget(self):
+        spent = []
+
+        def spend(n):
+            spent.append(n)
+            return True
+
+        calls = []
+
+        def fetcher(url):
+            calls.append(url)
+            return _fixture_html()
+
+        yahoo.search_keyword("テスト", pages=3, fetcher=fetcher, spend=spend)
+        # フィクスチャは毎ページ同じIDなので2ページ目で打ち切られるが、
+        # 取得したページ数と spend 回数は一致する
+        self.assertEqual(len(spent), len(calls))
+        self.assertGreaterEqual(len(spent), 1)
+
+    def test_budget_exhausted_on_first_page_raises(self):
+        with self.assertRaises(yahoo.BudgetExhausted):
+            yahoo.search_keyword("テスト", pages=1, fetcher=lambda _u: _fixture_html(),
+                                 spend=lambda _n: False)
+
+    def test_budget_exhausted_on_second_page_keeps_first(self):
+        state = {"left": 1}
+
+        def spend(n):
+            if state["left"] < n:
+                return False
+            state["left"] -= n
+            return True
+
+        items, _w = yahoo.search_keyword(
+            "テスト", pages=3, fetcher=lambda _u: _fixture_html(), spend=spend)
+        self.assertEqual(len(items), 10)
+
+
+class TestFailureTracker(unittest.TestCase):
+    """m22: 連続失敗は HTTP試行単位で数える（検索語単位だと実質9回続く）。"""
+
+    def test_tracker_counts_and_resets(self):
+        t = yahoo.FailureTracker(limit=3)
+        self.assertEqual(t.record_failure(OSError("x")), 1)
+        self.assertEqual(t.record_failure(OSError("x")), 2)
+        t.record_success()
+        self.assertEqual(t.consecutive, 0)
+        self.assertEqual(t.total, 2)
+
+    def test_tracker_exceeded_raises_from_search_keyword(self):
+        t = yahoo.FailureTracker(limit=3)
+
+        def boom(_url):
+            raise OSError("connection reset")
+
+        # 1語ごとに1回失敗 → 3語目で中断シグナル
+        with self.assertRaises(OSError):
+            yahoo.search_keyword("語1", fetcher=boom, tracker=t)
+        with self.assertRaises(OSError):
+            yahoo.search_keyword("語2", fetcher=boom, tracker=t)
+        with self.assertRaises(yahoo.ConsecutiveFailureError):
+            yahoo.search_keyword("語3", fetcher=boom, tracker=t)
+
+    def test_success_resets_tracker_between_keywords(self):
+        t = yahoo.FailureTracker(limit=3)
+        calls = []
+
+        def flaky(url):
+            calls.append(url)
+            if len(calls) % 2 == 1:
+                raise OSError("flaky")
+            return _fixture_html()
+
+        for i in range(6):
+            try:
+                yahoo.search_keyword("語%d" % i, fetcher=flaky, tracker=t)
+            except OSError:
+                pass
+        self.assertLess(t.consecutive, 3)
+
+    def test_default_fetcher_raises_consecutive_failure(self):
+        t = yahoo.FailureTracker(limit=3)
+        opened = []
+
+        def fake_urlopen(*_a, **_kw):
+            opened.append(1)
+            raise OSError("down")
+
+        original = yahoo.urllib.request.urlopen
+        yahoo.urllib.request.urlopen = fake_urlopen
+        try:
+            with self.assertRaises(yahoo.ConsecutiveFailureError):
+                yahoo.default_fetcher("https://example.invalid/", retries=3,
+                                      throttle_fn=lambda _s: None, tracker=t)
+        finally:
+            yahoo.urllib.request.urlopen = original
+        self.assertEqual(len(opened), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

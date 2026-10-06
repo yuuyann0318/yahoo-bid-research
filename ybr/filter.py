@@ -6,8 +6,13 @@ NG語照合は必ず normalize_for_match() を両辺に通す（NFKC + 小文字
 
 さらに、
 - 2〜4文字の ASCII 語（gp / gf 等）は**単語境界付き**で照合する（"GPS" を誤爆させない）。
-- allowPhrases（「GPではありません」等）と**文字位置が重なる**NG出現は除外しない
-  （否定表現の救済。出現ごとに判定するので「GPではありません。GP刻印あり」は除外される）。
+- K18GP / SV925GF のような**くっついた品位+めっき表記**は ngPatterns の正規表現で拾う（M5）。
+- allowPhrases（「GPではありません」等）に**完全に含まれる**NG出現だけ救済する（M13）。
+  部分的に重なるだけで救済すると「スーパーコピーライト」が通ってしまう。
+- カタカナNG語は、区切り文字（空白・ハイフン・中黒・アンダースコア）を抜いた文字列でも
+  照合する（「レ プ リ カ」対策・Codex#5）。長音「ー」は意味が変わるので抜かない。
+- 「風」「タイプ」は単独ではNGにしない。**ブランド名/ライン名の直後に来る形**だけNGにする
+  （「ティファニー風」はNG、「春風コレクション」「Aタイプ」は通す・M23）。
 """
 from __future__ import annotations
 
@@ -15,6 +20,11 @@ import re
 import unicodedata
 
 _ASCII_SHORT = re.compile(r"^[a-z0-9]{1,4}$")
+_KATAKANA_RE = re.compile(r"[ァ-ヶ]")
+# 区切り挿入による迂回対策で取り除く文字（長音「ー」は含めない）
+_SEPARATOR_RE = re.compile(r"[\s　\-‐‑‒–—－_・･.,/]")
+# ブランド名とサフィックス（風/タイプ）の間に挟まれても同一視する区切り
+_BRAND_GAP_RE = re.compile(r"^[\s　・\-_'\"]{0,3}")
 
 
 def normalize_for_match(text):
@@ -22,6 +32,11 @@ def normalize_for_match(text):
     if not text:
         return ""
     return unicodedata.normalize("NFKC", str(text)).lower()
+
+
+def strip_separators(text):
+    """区切り文字を抜いた文字列（「レ プ リ カ」「G-P」対策）。"""
+    return _SEPARATOR_RE.sub("", text or "")
 
 
 def _spans_of_word(haystack, word):
@@ -48,27 +63,32 @@ def _spans_of_pattern(haystack, pattern):
     return [(m.start(), m.end()) for m in rx.finditer(haystack)]
 
 
-def _allow_spans(haystack, allow_phrases):
+def _allow_spans(haystack, allow_phrases, allow_patterns=()):
+    """救済フレーズの出現位置。
+
+    救済は「完全包含」判定なので（M13）、くっついた表記
+    （K18GPではありません）を救うには**正規表現の救済**が必要になる。
+    ngPatterns と対になる allowPatterns をここで扱う。
+    """
     spans = []
     for phrase in allow_phrases or ():
         spans.extend(_spans_of_word(haystack, phrase))
+    for pattern in allow_patterns or ():
+        spans.extend(_spans_of_pattern(haystack, pattern))
     return spans
 
 
 def _covered(span, allow_spans):
+    """NG出現が許容フレーズに**完全に含まれる**ときだけ救済する（M13）。"""
     s, e = span
     for a_s, a_e in allow_spans:
-        if s < a_e and a_s < e:  # 文字位置が重なる
+        if a_s <= s and e <= a_e:
             return True
     return False
 
 
-def ng_hit(title, ng_words, allow_phrases=(), ng_patterns=()):
-    """NG語に該当すれば「該当した語」を返す。該当しなければ None。"""
-    hay = normalize_for_match(title)
-    if not hay:
-        return None
-    allowed = _allow_spans(hay, allow_phrases)
+def _ng_hit_in(hay, ng_words, allow_phrases, ng_patterns, allow_patterns=()):
+    allowed = _allow_spans(hay, allow_phrases, allow_patterns)
     for word in ng_words or ():
         for span in _spans_of_word(hay, word):
             if not _covered(span, allowed):
@@ -78,6 +98,63 @@ def ng_hit(title, ng_words, allow_phrases=(), ng_patterns=()):
             if not _covered(span, allowed):
                 return hay[span[0]:span[1]]
     return None
+
+
+def brand_suffix_hit(title, brand_terms, suffix_words, allow_phrases=(),
+                     allow_patterns=()):
+    """「<ブランド名|ライン名>風」「<ブランド名>タイプ」の形だけ検出する（M23）。
+
+    単独の「風」「タイプ」は NG にしない（「春風コレクション」「Aタイプ」を通すため）。
+    """
+    hay = normalize_for_match(title)
+    if not hay or not brand_terms or not suffix_words:
+        return None
+    allowed = _allow_spans(hay, allow_phrases, allow_patterns)
+    suffixes = [normalize_for_match(s) for s in suffix_words if s]
+    for term in brand_terms or ():
+        t = normalize_for_match(term)
+        if len(t) < 2:
+            continue
+        for start, end in _spans_of_word(hay, t):
+            tail = hay[end:end + 8]
+            gap = _BRAND_GAP_RE.match(tail)
+            offset = gap.end() if gap else 0
+            rest = tail[offset:]
+            for suf in suffixes:
+                if suf and rest.startswith(suf):
+                    span = (start, end + offset + len(suf))
+                    if not _covered(span, allowed):
+                        return hay[span[0]:span[1]]
+    return None
+
+
+def ng_hit(title, ng_words, allow_phrases=(), ng_patterns=(),
+           brand_terms=(), brand_suffix_words=(), allow_patterns=()):
+    """NG語に該当すれば「該当した語」を返す。該当しなければ None。"""
+    hay = normalize_for_match(title)
+    if not hay:
+        return None
+
+    hit = _ng_hit_in(hay, ng_words, allow_phrases, ng_patterns, allow_patterns)
+    if hit:
+        return hit
+
+    # 区切り挿入による迂回対策（カタカナNG語だけ・Codex#5）
+    kana_ng = [w for w in (ng_words or ()) if _KATAKANA_RE.search(str(w))]
+    if kana_ng:
+        hay_nosep = strip_separators(hay)
+        if hay_nosep != hay:
+            hit = _ng_hit_in(
+                hay_nosep,
+                [strip_separators(normalize_for_match(w)) for w in kana_ng],
+                [strip_separators(normalize_for_match(p)) for p in (allow_phrases or ())],
+                (),
+            )
+            if hit:
+                return hit
+
+    return brand_suffix_hit(title, brand_terms, brand_suffix_words,
+                            allow_phrases, allow_patterns)
 
 
 def caution_hits(title, caution_words):
@@ -117,6 +194,9 @@ def prefilter(items, profile, history=None, now=None):
     ng_patterns = profile.get("ngPatterns") or []
     allow_phrases = profile.get("allowPhrases") or []
     caution_words = profile.get("cautionWords") or []
+    brand_terms = profile.get("brandTerms") or []
+    brand_suffix_words = profile.get("brandSuffixNgWords") or []
+    allow_patterns = profile.get("allowPatterns") or []
 
     kept = []
     excluded = []
@@ -154,7 +234,9 @@ def prefilter(items, profile, history=None, now=None):
             excluded.append(c)
             continue
 
-        hit = ng_hit(c.get("title"), ng_words, allow_phrases, ng_patterns)
+        hit = ng_hit(c.get("title"), ng_words, allow_phrases, ng_patterns,
+                     brand_terms=brand_terms, brand_suffix_words=brand_suffix_words,
+                     allow_patterns=allow_patterns)
         if hit:
             c["excluded_reason"] = "NG語に該当({})".format(hit)
             c["excluded_kind"] = "NG語に該当"

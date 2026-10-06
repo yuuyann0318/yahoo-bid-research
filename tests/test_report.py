@@ -154,6 +154,104 @@ class TestCsv(unittest.TestCase):
             self.assertNotIn("\n", cell)
 
 
+class TestUrlStripping(unittest.TestCase):
+    """m20 / Codex#14: 大文字スキームの偽URLも除去する。"""
+
+    def test_uppercase_scheme_is_stripped(self):
+        bad = _adopted(title="カナダグース HTTPS://EVIL.INVALID/fake")
+        md = report.render_markdown(_payload(adopted=[bad]))
+        self.assertNotIn("EVIL.INVALID", md)
+        self.assertNotIn("evil.invalid", md.lower())
+
+    def test_mixed_case_scheme_is_stripped(self):
+        self.assertNotIn("evil", report.safe_title("商品名 HtTpS://evil.test/x").lower())
+
+    def test_ftp_scheme_is_stripped(self):
+        self.assertNotIn("evil", report.safe_title("商品名 ftp://evil.test/x").lower())
+
+    def test_normal_title_is_kept(self):
+        self.assertEqual(report.safe_title("ティファニー ネックレス"), "ティファニー ネックレス")
+
+
+class TestCsvInjection(unittest.TestCase):
+    """m20 / Codex#13: CSVの数式インジェクションを無害化する。"""
+
+    def test_formula_title_is_neutralized(self):
+        bad = _adopted(title="=1+1")
+        text = report.render_csv(_payload(adopted=[bad]))
+        rows = list(csv.reader(io.StringIO(text)))
+        title_idx = rows[0].index("商品名")
+        self.assertTrue(rows[1][title_idx].startswith("'="), rows[1][title_idx])
+
+    def test_all_lead_chars_are_neutralized(self):
+        for lead in ("=", "+", "-", "@"):
+            bad = _adopted(title=lead + "cmd")
+            rows = list(csv.reader(io.StringIO(report.render_csv(_payload(adopted=[bad])))))
+            idx = rows[0].index("商品名")
+            self.assertTrue(rows[1][idx].startswith("'" + lead), rows[1][idx])
+
+    def test_numbers_are_not_quoted(self):
+        rows = list(csv.reader(io.StringIO(report.render_csv(_payload()))))
+        idx = rows[0].index("入札提案価格")
+        self.assertEqual(rows[1][idx], "5700")
+
+    def test_normal_title_is_untouched(self):
+        rows = list(csv.reader(io.StringIO(report.render_csv(_payload()))))
+        idx = rows[0].index("商品名")
+        self.assertFalse(rows[1][idx].startswith("'"))
+
+
+class TestTrimmedFromDisclosure(unittest.TestCase):
+    """m18: 表示nがIQRトリム後であることを隠さない。"""
+
+    def test_label_shows_original_count(self):
+        c = _adopted()
+        c["comps"]["count"] = 110
+        c["comps"]["trimmed_from"] = 115
+        self.assertEqual(report.comps_count_label(c), "110（元115・外れ値除外）")
+
+    def test_label_without_trim(self):
+        self.assertEqual(report.comps_count_label(_adopted()), "12")
+
+    def test_md_shows_trim_info(self):
+        c = _adopted()
+        c["comps"]["count"] = 110
+        c["comps"]["trimmed_from"] = 115
+        c["profit"]["comps_count"] = 110
+        md = report.render_markdown(_payload(adopted=[c]))
+        self.assertIn("元115・外れ値除外", md)
+
+    def test_csv_has_original_count_column(self):
+        c = _adopted()
+        c["comps"]["count"] = 110
+        c["comps"]["trimmed_from"] = 115
+        rows = list(csv.reader(io.StringIO(report.render_csv(_payload(adopted=[c])))))
+        self.assertIn("相場元件数", rows[0])
+        self.assertEqual(rows[1][rows[0].index("相場元件数")], "115")
+
+
+class TestUnqueriedWording(unittest.TestCase):
+    """C3: result.md でも「未照会」と「売切0件」を言い分ける。"""
+
+    def test_zero_hits_wording(self):
+        c = _adopted()
+        c["comps"] = None
+        c["comps_status"] = "zero_hits"
+        c["profit"]["expected_sale"] = None
+        md = report.render_markdown(_payload(adopted=[c]))
+        self.assertIn("相場不明(売切0件)", md)
+
+    def test_unqueried_wording(self):
+        c = _adopted()
+        c["comps"] = None
+        c["comps_status"] = "budget_exhausted"
+        c["comps_error"] = "メルカリ照会の予算切れで未照会"
+        c["profit"]["expected_sale"] = None
+        md = report.render_markdown(_payload(adopted=[c]))
+        self.assertIn("未照会", md)
+        self.assertNotIn("売切0件", md)
+
+
 class TestWriteOutputs(unittest.TestCase):
     def test_writes_four_files(self):
         with tempfile.TemporaryDirectory() as d:
