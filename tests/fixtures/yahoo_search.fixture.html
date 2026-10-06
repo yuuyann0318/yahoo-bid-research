@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head><meta charset="utf-8"><title>ヤフオク検索 合成fixture（テスト専用・架空データ）</title></head>
+<body>
+<div id="Contents">
+<ul class="Products__items">
+
+<!-- 1) アクセ通常: 現在12,000円 / 送料無料 / 残り1日 / 個人出品(英字始まり) -->
+<li class="Product">
+<div class="Product__detail" data-auction-id="x1234567890" data-auction-title="ティファニー オープンハート ネックレス SV925 美品" data-auction-img="https://example.invalid/img/a.jpg" data-auction-isfreeshipping="1">
+<div class="Product__priceInfo">
+<span class="Product__price"><span class="Product__label">現在</span><span class="Product__priceValue u-textRed">12,000円</span></span>
+</div>
+<dl class="Product__otherInfo">
+<dt>入札</dt><dd class="Product__bidWrap">3</dd>
+<dt>残り</dt><dd class="Product__timeWrap">1日</dd>
+</dl>
+<span class="Product__postage">送料無料</span>
+</div>
+</li>
+
+<!-- 2) 即決のみ: 現在価格なし / 送料700円 / 残り12時間 -->
+<li class="Product">
+<div class="Product__detail" data-auction-id="b2223334445" data-auction-title="ティファニー バイザヤード ネックレス ダイヤ 1P" data-auction-isfreeshipping="0">
+<div class="Product__priceInfo">
+<span class="Product__price"><span class="Product__label">即決</span><span class="Product__priceValue">25,800円</span></span>
+</div>
+<dl class="Product__otherInfo">
+<dt>入札</dt><dd class="Product__bidWrap">0</dd>
+<dt>残り</dt><dd class="Product__timeWrap">12時間</dd>
+</dl>
+<span class="Product__postage">送料700円</span>
+</div>
+</li>
+
+<!-- 3) 送料未定: 現在+即決の両方 / 残り3日12時間 -->
+<li class="Product">
+<div class="Product__detail" data-auction-id="c3334445556" data-auction-title="モンクレール ダウン ジャケット メンズ M ネイビー" data-auction-isfreeshipping="0">
+<div class="Product__priceInfo">
+<span class="Product__price"><span class="Product__label">現在</span><span class="Product__priceValue u-textRed">30,000円</span></span>
+<span class="Product__price"><span class="Product__label">即決</span><span class="Product__priceValue">45,000円</span></span>
+</div>
+<dl class="Product__otherInfo">
+<dt>入札</dt><dd class="Product__bidWrap">5</dd>
+<dt>残り</dt><dd class="Product__timeWrap">3日12時間</dd>
+</dl>
+<span class="Product__postage">送料未定</span>
+</div>
+</li>
+
+<!-- 4) NGワード(半角カナ): ﾚﾌﾟﾘｶ -->
+<li class="Product">
+<div class="Product__detail" data-auction-id="d4445556667" data-auction-title="ティファニー ネックレス ﾚﾌﾟﾘｶ 品" data-auction-isfreeshipping="1">
+<div class="Product__priceInfo">
+<span class="Product__price"><span class="Product__label">現在</span><span class="Product__priceValue u-textRed">4,000円</span></span>
+</div>
+<dl class="Product__otherInfo">
+<dt>入札</dt><dd class="Product__bidWrap">1</dd>
+<dt>残り</dt><dd class="Product__timeWrap">2日</dd>
+</dl>
+<span class="Product__postage">送料無料</span>
+</div>
+</li>
+
+<!-- 5) 残り30分（締切間近すぎ） -->
+<li class="Product">
+<div class="Product__detail" data-auction-id="e5556667778" data-auction-title="グッチ シルバー リング 925" data-auction-isfreeshipping="1">
+<div class="Product__priceInfo">
+<span class="Product__price"><span class="Product__label">現在</span><span class="Product__priceValue u-textRed">8,000円</span></span>
+</div>
+<dl class="Product__otherInfo">
+<dt>入札</dt><dd class="Product__bidWrap">2</dd>
+<dt>残り</dt><dd class="Product__timeWrap">30分</dd>
+</dl>
+<span class="Product__postage">送料無料</span>
+</div>
+</li>
+
+<!-- 6) 残り5日（72h超） -->
+<li class="Product">
+<div class="Product__detail" data-auction-id="f6667778889" data-auction-title="バーバリー トレンチコート ノバチェック ライナー付" data-auction-isfreeshipping="1">
+<div class="Product__priceInfo">
+<span class="Product__price"><span class="Product__label">現在</span><span class="Product__priceValue u-textRed">15,000円</span></span>
+</div>
+<dl class="Product__otherInfo">
+<dt>入札</dt><dd class="Product__bidWrap">0</dd>
+<dt>残り</dt><dd class="Product__timeWrap">5日</dd>
+</dl>
+<span class="Product__postage">送料無料</span>
+</div>
+</li>
+
+<!-- 7) ストア出品(数字始まりID) / 総額が下限未満(500円) -->
+<li class="Product">
+<div class="Product__detail" data-auction-id="1234567890" data-auction-title="シルバー チェーン 50cm" data-auction-isfreeshipping="1">
+<div class="Product__priceInfo">
+<span class="Product__price"><span class="Product__label">現在</span><span class="Product__priceValue u-textRed">500円</span></span>
+</div>
+<dl class="Product__otherInfo">
+<dt>入札</dt><dd class="Product__bidWrap">0</dd>
+<dt>残り</dt><dd class="Product__timeWrap">1日</dd>
+</dl>
+<span class="Product__postage">送料無料</span>
+</div>
+</li>
+
+<!-- 8) 価格が取れない（パーサがスキップする） -->
+<li class="Product">
+<div class="Product__detail" data-auction-id="g7778889990" data-auction-title="価格未取得の商品" data-auction-isfreeshipping="1">
+<div class="Product__priceInfo"><span class="Product__price">お問い合わせ</span></div>
+<dl class="Product__otherInfo">
+<dt>残り</dt><dd class="Product__timeWrap">1日</dd>
+</dl>
+<span class="Product__postage">送料無料</span>
+</div>
+</li>
+
+<!-- 9) 不正なID（英数字以外を含む＝パーサが弾く） -->
+<li class="Product">
+<div class="Product__detail" data-auction-id="x12-34&quot;onload" data-auction-title="不正ID商品" data-auction-isfreeshipping="1">
+<div class="Product__priceInfo">
+<span class="Product__price"><span class="Product__label">現在</span><span class="Product__priceValue u-textRed">9,000円</span></span>
+</div>
+<dl class="Product__otherInfo">
+<dt>残り</dt><dd class="Product__timeWrap">1日</dd>
+</dl>
+<span class="Product__postage">送料無料</span>
+</div>
+</li>
+
+<!-- 10) アパレル: ダメージ加工（NGにしない） -->
+<li class="Product">
+<div class="Product__detail" data-auction-id="h8889990001" data-auction-title="リーバイス 501 ビンテージ ダメージ加工 W32" data-auction-isfreeshipping="0">
+<div class="Product__priceInfo">
+<span class="Product__price"><span class="Product__label">現在</span><span class="Product__priceValue u-textRed">6,800円</span></span>
+</div>
+<dl class="Product__otherInfo">
+<dt>入札</dt><dd class="Product__bidWrap">4</dd>
+<dt>残り</dt><dd class="Product__timeWrap">1日6時間</dd>
+</dl>
+<span class="Product__postage">送料1,200円</span>
+</div>
+</li>
+
+<!-- 11) アパレル: 汚れあり（NG） -->
+<li class="Product">
+<div class="Product__detail" data-auction-id="i9990001112" data-auction-title="シュプリーム パーカー 汚れあり" data-auction-isfreeshipping="1">
+<div class="Product__priceInfo">
+<span class="Product__price"><span class="Product__label">現在</span><span class="Product__priceValue u-textRed">7,000円</span></span>
+</div>
+<dl class="Product__otherInfo">
+<dt>入札</dt><dd class="Product__bidWrap">1</dd>
+<dt>残り</dt><dd class="Product__timeWrap">1日</dd>
+</dl>
+<span class="Product__postage">送料無料</span>
+</div>
+</li>
+
+<!-- 12) タイトルに制御文字（&#10;）が混入 -->
+<li class="Product">
+<div class="Product__detail" data-auction-id="j0001112223" data-auction-title="カナダグース ダウン&#10;https://evil.invalid/fake ＧＰ" data-auction-isfreeshipping="1">
+<div class="Product__priceInfo">
+<span class="Product__price"><span class="Product__label">現在</span><span class="Product__priceValue u-textRed">40,000円</span></span>
+</div>
+<dl class="Product__otherInfo">
+<dt>入札</dt><dd class="Product__bidWrap">8</dd>
+<dt>残り</dt><dd class="Product__timeWrap">2日</dd>
+</dl>
+<span class="Product__postage">送料無料</span>
+</div>
+</li>
+
+</ul>
+</div>
+</body>
+</html>

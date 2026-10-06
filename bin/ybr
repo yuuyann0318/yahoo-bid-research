@@ -1,0 +1,124 @@
+#!/bin/bash
+# ybr: ヤフオク入札リサーチ CLI
+#   setup     … venv を作って mercapi==0.4.2 を入れる（失敗時はシステムの mercapi を使う）
+#   selftest  … ネットワークを使わずに環境と設定を点検する
+#   run       … リサーチを実行して reports/<時刻>/ に出力する（入札はしない）
+#   test      … unittest を実行する（ネットワーク不使用）
+#   report    … 直近の result.md のパスを表示して中身を出す
+#
+# 終了コード（run）: 0=成功 / 1=使い方エラー / 2=候補0件 / 3=取得失敗(403/429/通信断/上限)
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENV_PY="$ROOT/.venv/bin/python"
+
+have_mercapi() {
+  "$1" -c 'import mercapi' >/dev/null 2>&1
+}
+
+# mercapi が import できる python を優先して返す（無ければ素の python3）
+resolve_python() {
+  if [ -x "$VENV_PY" ] && have_mercapi "$VENV_PY"; then
+    echo "$VENV_PY"; return 0
+  fi
+  local sys_py
+  sys_py="$(command -v python3 || true)"
+  if [ -n "$sys_py" ] && have_mercapi "$sys_py"; then
+    echo "$sys_py"; return 0
+  fi
+  if [ -x "$VENV_PY" ]; then
+    echo "$VENV_PY"; return 0
+  fi
+  if [ -n "$sys_py" ]; then
+    echo "$sys_py"; return 0
+  fi
+  echo "python3 が見つかりません" >&2
+  return 1
+}
+
+cmd_setup() {
+  local sys_py
+  sys_py="$(command -v python3 || true)"
+  if [ -z "$sys_py" ]; then
+    echo "NG: python3 が見つかりません" >&2
+    return 1
+  fi
+  echo "python3: $sys_py ($("$sys_py" -V 2>&1))"
+
+  if [ ! -x "$VENV_PY" ]; then
+    echo "venv を作成: $ROOT/.venv"
+    if ! "$sys_py" -m venv "$ROOT/.venv" 2>&1; then
+      echo "WARN: venv の作成に失敗しました。システムの python3 を使います。" >&2
+    fi
+  fi
+
+  if [ -x "$VENV_PY" ]; then
+    echo "mercapi==0.4.2 を venv に導入します"
+    "$VENV_PY" -m pip install --quiet --upgrade pip >/dev/null 2>&1
+    if "$VENV_PY" -m pip install --quiet "mercapi==0.4.2"; then
+      echo "venv: mercapi OK"
+    else
+      echo "WARN: venv への mercapi 導入に失敗しました。" >&2
+    fi
+  fi
+
+  local py
+  py="$(resolve_python)" || return 1
+  if have_mercapi "$py"; then
+    echo "使用する python: $py (mercapi あり)"
+  else
+    echo "NG: mercapi が使える python がありません。" >&2
+    echo "    手動で: $sys_py -m pip install 'mercapi==0.4.2'" >&2
+    return 1
+  fi
+  cmd_selftest
+}
+
+cmd_selftest() {
+  local py
+  py="$(resolve_python)" || return 1
+  ( cd "$ROOT" && "$py" -m ybr.cli selftest )
+}
+
+cmd_run() {
+  local py
+  py="$(resolve_python)" || return 1
+  ( cd "$ROOT" && "$py" -m ybr.cli run "$@" )
+}
+
+cmd_test() {
+  local py
+  py="$(resolve_python)" || return 1
+  ( cd "$ROOT" && "$py" -m unittest discover -s tests -t . -v )
+}
+
+cmd_report() {
+  local latest
+  latest="$(ls -1dt "$ROOT"/reports/*/ 2>/dev/null | head -1 || true)"
+  if [ -z "$latest" ]; then
+    echo "レポートがまだありません（bin/ybr run を実行してください）" >&2
+    return 1
+  fi
+  local md="${latest}result.md"
+  if [ ! -f "$md" ]; then
+    echo "result.md が見つかりません: $latest" >&2
+    return 1
+  fi
+  echo "$md"
+  echo "---"
+  cat "$md"
+}
+
+usage() {
+  sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+case "${1:-}" in
+  setup)    shift; cmd_setup "$@" ;;
+  selftest) shift; cmd_selftest "$@" ;;
+  run)      shift; cmd_run "$@" ;;
+  test)     shift; cmd_test "$@" ;;
+  report)   shift; cmd_report "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *) echo "未知のコマンド: $1" >&2; usage >&2; exit 1 ;;
+esac

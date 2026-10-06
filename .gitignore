@@ -1,0 +1,8 @@
+# 出力・キャッシュ・仮想環境は追跡しない
+reports/
+state/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
